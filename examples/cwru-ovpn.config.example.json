@@ -1,0 +1,26 @@
+{
+  "profilePath": "~/.cwru-ovpn/profile.ovpn",
+  "tunnelMode": "split",
+  "allowSleep": false,
+  "verbosity": "daily",
+  "splitTunnel": {
+    "includedRoutes": [
+      "129.22.0.0/16"
+    ],
+    "reachabilityProbeHosts": [
+      "1.1.1.1",
+      "8.8.8.8",
+      "223.5.5.5"
+    ],
+    "resolverDomains": [
+      "case.edu",
+      "cwru.edu"
+    ],
+    "resolverNameServers": [
+      "129.22.4.32",
+      "129.22.104.132",
+      "129.22.4.31",
+      "129.22.104.25"
+    ]
+  }
+}
