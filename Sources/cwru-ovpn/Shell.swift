@@ -118,10 +118,7 @@ enum Shell {
             try process.run()
         }
 
-        // Read stdout and stderr concurrently on background threads before calling
-        // waitUntilExit(). If the child writes more than the pipe buffer (~64 KB),
-        // it will block on the write while the parent is stuck in waitUntilExit() —
-        // a classic deadlock. Draining the pipes first prevents this.
+        // Drain both pipes before waitUntilExit() so large child output cannot deadlock the parent.
         let stdoutCollector = PipeCollector(handle: stdoutPipe.fileHandleForReading)
         let stderrCollector = PipeCollector(handle: stderrPipe.fileHandleForReading)
         stdoutCollector.start()

@@ -29,9 +29,22 @@ struct ManagedIPv4Route: Codable, Equatable {
     let nextHopValue: String
 }
 
+private struct ActiveDNSResolver {
+    var domain: String?
+    var nameServers: [String] = []
+    var searchDomains: [String] = []
+
+    var hasContent: Bool {
+        domain != nil || !nameServers.isEmpty || !searchDomains.isEmpty
+    }
+}
+
 enum RouteManagerError: LocalizedError {
     case couldNotDeterminePhysicalGateway
     case failedToRestoreFullTunnelRoutes
+    case failedToRestoreFullTunnelIPv6Routes
+    case failedToIsolateSplitTunnelDNS
+    case invalidTunnelInterface
 
     var errorDescription: String? {
         switch self {
@@ -39,6 +52,12 @@ enum RouteManagerError: LocalizedError {
             return "Could not determine a non-VPN default gateway."
         case .failedToRestoreFullTunnelRoutes:
             return "Failed to restore full-tunnel default routes."
+        case .failedToRestoreFullTunnelIPv6Routes:
+            return "Failed to secure full-tunnel IPv6 traffic."
+        case .failedToIsolateSplitTunnelDNS:
+            return "Split-tunnel DNS isolation could not be enforced."
+        case .invalidTunnelInterface:
+            return "Encountered an unexpected tunnel interface name."
         }
     }
 }
@@ -97,13 +116,13 @@ struct RouteManager {
               let tunnelName = state.tunName else {
             return
         }
+        let validatedTunnelName = try validatedTunnelInterfaceName(tunnelName)
 
         var mutatedNetwork = false
 
         do {
-            try removeOpenVPNDefaultRoutes(tunnelName: tunnelName)
-            // Set only after the first actual mutation so cleanup is not triggered
-            // when the route commands themselves fail to launch.
+            try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
+            // Only mark the network as mutated after the first route change succeeds.
             mutatedNetwork = true
             for route in cleanupIncludedRoutes(using: state) {
                 _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
@@ -112,14 +131,14 @@ struct RouteManager {
             _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", "0.0.0.0/1", gateway], requirePrivileges: true)
             _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", "128.0.0.0/1", gateway], requirePrivileges: true)
             for route in cleanupIncludedRoutes(using: state) {
-                _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", route, "-interface", tunnelName], requirePrivileges: true)
+                _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", route, "-interface", validatedTunnelName], requirePrivileges: true)
             }
 
             try disablePhysicalIPv6ForSplitTunnel(using: state)
             try installResolverFiles(using: state)
             try restoreDNSConfiguration(using: state)
-            try validateSplitTunnelPrivacy(using: state)
             try flushDNS()
+            try validateSplitTunnelPrivacy(using: state)
 
             state.appliedIncludedRoutes = cleanupIncludedRoutes(using: state)
             state.appliedResolverDomains = cleanupResolverDomains(using: state)
@@ -138,7 +157,16 @@ struct RouteManager {
             return
         }
 
-        try removeOpenVPNIPv6DefaultRoutes(tunnelName: tunnelName)
+        let validatedTunnelName = try validatedTunnelInterfaceName(tunnelName)
+        if try fullTunnelIPv6LooksSafe(tunnelName: validatedTunnelName) {
+            return
+        }
+
+        try disablePhysicalIPv6ForSplitTunnel(using: state)
+
+        guard try fullTunnelIPv6LooksSafe(tunnelName: validatedTunnelName) else {
+            throw RouteManagerError.failedToRestoreFullTunnelIPv6Routes
+        }
     }
 
     func switchToFullTunnel(using state: inout SessionState,
@@ -146,6 +174,7 @@ struct RouteManager {
         guard let tunnelName = state.tunName, !tunnelName.isEmpty else {
             return
         }
+        let validatedTunnelName = try validatedTunnelInterfaceName(tunnelName)
 
         for route in cleanupIncludedRoutes(using: state) {
             _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
@@ -155,7 +184,7 @@ struct RouteManager {
         _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "0.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
         _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "128.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
 
-        let routesToRestore = resolvedFullTunnelDefaultRoutes(from: fullTunnelRoutes, tunnelName: tunnelName)
+        let routesToRestore = resolvedFullTunnelDefaultRoutes(from: fullTunnelRoutes, tunnelName: validatedTunnelName)
         for route in routesToRestore {
             switch route.nextHopKind {
             case .gateway:
@@ -182,9 +211,13 @@ struct RouteManager {
         try applyFullTunnelSafety(using: state)
 
         state.fullTunnelDefaultRoutes = routesToRestore
-        state.fullTunnelDNSServers = (state.fullTunnelDNSServers ?? state.pushedDNSServers ?? state.originalDNSServers ?? [])
+        state.fullTunnelDNSServers = firstNonEmptyList(state.fullTunnelDNSServers,
+                                                       state.pushedDNSServers,
+                                                       state.originalDNSServers)
             .filter(AppConfig.SplitTunnelConfiguration.isValidIPAddress)
-        state.fullTunnelSearchDomains = (state.fullTunnelSearchDomains ?? state.pushedSearchDomains ?? state.originalSearchDomains ?? [])
+        state.fullTunnelSearchDomains = firstNonEmptyList(state.fullTunnelSearchDomains,
+                                                          state.pushedSearchDomains,
+                                                          state.originalSearchDomains)
             .filter(AppConfig.SplitTunnelConfiguration.isValidDomainName)
         state.routesApplied = false
     }
@@ -234,7 +267,9 @@ struct RouteManager {
 
     @discardableResult
     func prepareForConnection(using state: SessionState) throws -> Int {
-        try removeRemoteHostRoutes(forProfilePath: state.profilePath)
+        try removeRemoteHostRoutes(forProfilePath: state.profilePath,
+                                   preferredRemoteIP: nil,
+                                   resolveDNS: true)
     }
 
     func physicalNetworkHasChanged(comparedTo state: SessionState) -> Bool {
@@ -251,8 +286,9 @@ struct RouteManager {
         guard let tunnelName = state.tunName else {
             return false
         }
+        let validatedTunnelName = try validatedTunnelInterfaceName(tunnelName)
 
-        guard tunnelInterfaceIsPresent(named: tunnelName) else {
+        guard tunnelInterfaceIsPresent(named: validatedTunnelName) else {
             return false
         }
 
@@ -264,7 +300,7 @@ struct RouteManager {
         var needsRepair = false
 
         for route in cleanupIncludedRoutes(using: state) {
-            if !routeExists(route, on: tunnelName, in: routingTable) {
+            if !routeExists(route, on: validatedTunnelName, in: routingTable) {
                 needsRepair = true
                 break
             }
@@ -275,12 +311,12 @@ struct RouteManager {
         }
 
         if needsRepair {
-            try removeOpenVPNDefaultRoutes(tunnelName: tunnelName)
+            try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
             _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", "0.0.0.0/1", gateway], allowNonZero: true, requirePrivileges: true)
             _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", "128.0.0.0/1", gateway], allowNonZero: true, requirePrivileges: true)
             for route in cleanupIncludedRoutes(using: state) {
                 _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
-                _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", route, "-interface", tunnelName], allowNonZero: true, requirePrivileges: true)
+                _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", route, "-interface", validatedTunnelName], allowNonZero: true, requirePrivileges: true)
             }
             try validateSplitTunnelPrivacy(using: state)
             try flushDNS()
@@ -295,15 +331,9 @@ struct RouteManager {
             _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
         }
         try removeOpenVPNDefaultRoutes(tunnelName: state.tunName)
-        _ = try removeRemoteHostRoutes(forProfilePath: state.profilePath)
-        if let serverIP = state.serverIP, !serverIP.isEmpty {
-            var routeArguments = ["-n", "delete", "-host"]
-            if isIPv6Address(serverIP) {
-                routeArguments.append("-inet6")
-            }
-            routeArguments.append(serverIP)
-            _ = try Shell.run("/sbin/route", arguments: routeArguments, allowNonZero: true, requirePrivileges: true)
-        }
+        _ = try removeRemoteHostRoutes(forProfilePath: state.profilePath,
+                                       preferredRemoteIP: state.serverIP,
+                                       resolveDNS: false)
 
         try restoreDefaultRouteIfNecessary(using: state)
         try restoreDNSConfiguration(using: state)
@@ -362,16 +392,6 @@ struct RouteManager {
         }
     }
 
-    /// Returns true when `name` is safe to use as the filename component of a
-    /// path under `/etc/resolver/`. Rejects empty strings, path separators, and
-    /// dot-dot sequences that could escape the directory.
-    private func isSafeResolverFileName(_ name: String) -> Bool {
-        guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else {
-            return false
-        }
-        return name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
-    }
-
     private func resolverContents(for domain: String, nameServers: [String]) -> String {
         var lines = nameServers.map { "nameserver \($0)" }
         lines.append("domain \(domain)")
@@ -395,7 +415,8 @@ struct RouteManager {
     private func cleanupResolverDomains(using state: SessionState) -> [String] {
         let candidates = state.appliedResolverDomains ?? configuration.effectiveResolverDomains
         return candidates.filter {
-            AppConfig.SplitTunnelConfiguration.isValidDomainName($0) && isSafeResolverFileName($0)
+            AppConfig.SplitTunnelConfiguration.isValidDomainName($0)
+                && ResolverPaths.isSafeDomainFileName($0)
         }
     }
 
@@ -414,11 +435,7 @@ struct RouteManager {
             return
         }
 
-        // The stored gateway was captured at connect time. If the user roamed
-        // networks while the VPN was up, it is no longer on any directly
-        // connected subnet — re-adding it would either fail or leave us with
-        // a useless default route. Only restore when the host-route lookup
-        // resolves the gateway via a real physical interface.
+        // Only restore the captured gateway if it still resolves through a physical interface.
         let probe = try Shell.run("/sbin/route",
                                   arguments: ["-n", "get", gateway],
                                   allowNonZero: true)
@@ -441,7 +458,7 @@ struct RouteManager {
             return
         }
 
-        try removeOpenVPNIPv6DefaultRoutes(tunnelName: tunnelName)
+        try removeOpenVPNIPv6DefaultRoutes(tunnelName: try validatedTunnelInterfaceName(tunnelName))
     }
 
     private func removeOpenVPNIPv6DefaultRoutes(tunnelName: String) throws {
@@ -490,9 +507,13 @@ struct RouteManager {
             return
         }
 
-        let dnsServers = (state.fullTunnelDNSServers ?? state.pushedDNSServers ?? state.originalDNSServers ?? [])
+        let dnsServers = firstNonEmptyList(state.fullTunnelDNSServers,
+                                           state.pushedDNSServers,
+                                           state.originalDNSServers)
             .filter(AppConfig.SplitTunnelConfiguration.isValidIPAddress)
-        let searchDomains = (state.fullTunnelSearchDomains ?? state.pushedSearchDomains ?? state.originalSearchDomains ?? [])
+        let searchDomains = firstNonEmptyList(state.fullTunnelSearchDomains,
+                                              state.pushedSearchDomains,
+                                              state.originalSearchDomains)
             .filter(AppConfig.SplitTunnelConfiguration.isValidDomainName)
 
         let dnsArguments = dnsServers.isEmpty ? ["-setdnsservers", serviceName, "empty"] : ["-setdnsservers", serviceName] + dnsServers
@@ -510,6 +531,7 @@ struct RouteManager {
         try validatePhysicalDNSRestored(using: state)
         try validateResolverFiles(using: state)
         try validatePhysicalIPv6Disabled(using: state)
+        try validateActiveDefaultResolverIsolation(using: state)
     }
 
     private func validateCleanupState(using state: SessionState) throws -> Bool {
@@ -625,6 +647,21 @@ struct RouteManager {
         }
     }
 
+    private func validateActiveDefaultResolverIsolation(using state: SessionState) throws {
+        guard activeDefaultResolverUsesVPNDNS(using: state) else {
+            return
+        }
+
+        EventLog.append(note: "Split-tunnel privacy check restored the active default DNS resolver.",
+                        phase: state.phase)
+        try restoreDNSConfiguration(using: state)
+        try flushDNS()
+
+        guard !activeDefaultResolverUsesVPNDNS(using: state) else {
+            throw RouteManagerError.failedToIsolateSplitTunnelDNS
+        }
+    }
+
     private func cleanupPhysicalIPv6LooksHealthy(using state: SessionState) throws -> Bool {
         guard let serviceName = state.physicalServiceName, !serviceName.isEmpty else {
             return true
@@ -633,21 +670,55 @@ struct RouteManager {
         return normalizedIPv6Mode(try ipv6Mode(forServiceNamed: serviceName)) == normalizedIPv6Mode(state.originalIPv6Mode)
     }
 
+    private func firstNonEmptyList<T>(_ candidates: [T]?...) -> [T] {
+        for candidate in candidates {
+            if let candidate, !candidate.isEmpty {
+                return candidate
+            }
+        }
+
+        return []
+    }
+
+    private func fullTunnelIPv6LooksSafe(tunnelName: String) throws -> Bool {
+        for destination in ["2001:4860:4860::8888", "3000::1"] {
+            let probe = try Shell.run("/sbin/route",
+                                      arguments: ["-n", "get", "-inet6", destination],
+                                      allowNonZero: true)
+
+            if probe.exitCode != 0 {
+                continue
+            }
+
+            let parsed = parseGatewayAndInterface(probe.stdout)
+            if parsed.interfaceName == tunnelName {
+                continue
+            }
+
+            if probe.stdout.contains("REJECT")
+                || (parsed.interfaceName == "lo0" && parsed.gateway == "::1") {
+                continue
+            }
+
+            if let interfaceName = parsed.interfaceName,
+               !interfaceName.hasPrefix("utun"),
+               !interfaceName.hasPrefix("ppp") {
+                return false
+            }
+        }
+
+        return true
+    }
+
     private func cleanupDefaultRouteLooksHealthy(using state: SessionState) throws -> Bool {
         let defaultRoute = try Shell.run("/sbin/route", arguments: ["-n", "get", "default"], allowNonZero: true)
         let parsed = parseGatewayAndInterface(defaultRoute.stdout)
         guard let currentInterface = parsed.interfaceName else {
-            // No default route at all — nothing we can restore if the captured
-            // physical gateway is absent; if we have one, the connect-path
-            // restore already tried to add it. Either way, flag as unhealthy.
+            // No default route is only healthy when we never captured one to restore.
             return state.physicalGateway == nil
         }
 
-        // The only thing cleanup actually has to guarantee is that the default
-        // route has moved off the VPN tunnel. Matching the gateway captured at
-        // connect time is too strict: the user may have roamed to a different
-        // network since the session started, which would otherwise trap them in
-        // a permanent "unhealthy" state with no way to reconnect.
+        // Cleanup only has to move the default route off the VPN tunnel; roaming can change the gateway.
         return !currentInterface.hasPrefix("utun") && !currentInterface.hasPrefix("ppp")
     }
 
@@ -713,9 +784,85 @@ struct RouteManager {
         return nil
     }
 
+    private func activeDefaultResolverUsesVPNDNS(using state: SessionState) -> Bool {
+        guard let output = try? Shell.run("/usr/sbin/scutil", arguments: ["--dns"], allowNonZero: true).stdout else {
+            return false
+        }
+
+        let vpnNameServers = Set(resolverNameServers(for: state))
+        let vpnDomains = Set(cleanupResolverDomains(using: state))
+        guard !vpnNameServers.isEmpty || !vpnDomains.isEmpty else {
+            return false
+        }
+
+        for resolver in parseActiveDNSResolvers(output) where resolver.domain == nil {
+            if resolver.nameServers.contains(where: { vpnNameServers.contains($0) }) {
+                return true
+            }
+            if resolver.searchDomains.contains(where: { vpnDomains.contains($0) }) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func parseActiveDNSResolvers(_ output: String) -> [ActiveDNSResolver] {
+        var resolvers: [ActiveDNSResolver] = []
+        var current = ActiveDNSResolver()
+
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line == "DNS configuration (for scoped queries)" {
+                break
+            }
+
+            if line.hasPrefix("resolver #") {
+                if current.hasContent {
+                    resolvers.append(current)
+                }
+                current = ActiveDNSResolver()
+                continue
+            }
+
+            if line.hasPrefix("domain") {
+                if let value = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !value.isEmpty {
+                    current.domain = value
+                }
+                continue
+            }
+
+            if line.hasPrefix("search domain[") {
+                if let value = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !value.isEmpty {
+                    current.searchDomains.append(value)
+                }
+                continue
+            }
+
+            if line.hasPrefix("nameserver[") {
+                if let value = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !value.isEmpty {
+                    current.nameServers.append(value)
+                }
+            }
+        }
+
+        if current.hasContent {
+            resolvers.append(current)
+        }
+
+        return resolvers
+    }
+
     @discardableResult
-    private func removeRemoteHostRoutes(forProfilePath profilePath: String) throws -> Int {
-        let remoteIPs = resolveRemoteIPv4Addresses(fromProfilePath: profilePath)
+    private func removeRemoteHostRoutes(forProfilePath profilePath: String,
+                                        preferredRemoteIP: String?,
+                                        resolveDNS: Bool) throws -> Int {
+        let remoteIPs = resolveRemoteIPv4Addresses(fromProfilePath: profilePath,
+                                                   preferredRemoteIP: preferredRemoteIP,
+                                                   resolveDNS: resolveDNS)
         guard !remoteIPs.isEmpty else {
             return 0
         }
@@ -840,9 +987,23 @@ struct RouteManager {
         }
     }
 
-    private func resolveRemoteIPv4Addresses(fromProfilePath profilePath: String) -> Set<String> {
+    private func validatedTunnelInterfaceName(_ tunnelName: String) throws -> String {
+        guard isSafeInterfaceName(tunnelName) else {
+            throw RouteManagerError.invalidTunnelInterface
+        }
+        return tunnelName
+    }
+
+    private func resolveRemoteIPv4Addresses(fromProfilePath profilePath: String,
+                                            preferredRemoteIP: String?,
+                                            resolveDNS: Bool) -> Set<String> {
+        var addresses = Set<String>()
+        if let preferredRemoteIP, isIPv4Address(preferredRemoteIP) {
+            addresses.insert(preferredRemoteIP)
+        }
+
         guard let profileContents = try? String(contentsOfFile: profilePath, encoding: .utf8) else {
-            return []
+            return addresses
         }
 
         let remoteHosts = Set(
@@ -861,8 +1022,16 @@ struct RouteManager {
                 }
         )
 
-        var addresses = Set<String>()
         for host in remoteHosts {
+            if isIPv4Address(host) {
+                addresses.insert(host)
+                continue
+            }
+
+            guard resolveDNS else {
+                continue
+            }
+
             var hints = addrinfo(
                 ai_flags: AI_ADDRCONFIG,
                 ai_family: AF_INET,
@@ -940,13 +1109,13 @@ struct RouteManager {
                     detailIndex += 1
                     continue
                 }
-                if detailLine.hasPrefix("(") {
-                    break
-                }
                 if let serviceName,
                    detailLine.contains("(Hardware Port:"),
                    detailLine.contains("Device: \(interfaceName)") {
                     return serviceName
+                }
+                if detailLine.hasPrefix("(") {
+                    break
                 }
                 detailIndex += 1
             }
@@ -1015,13 +1184,6 @@ struct RouteManager {
 
         let mask: UInt32 = prefixLength == 0 ? 0 : (~UInt32(0) << (32 - prefixLength))
         return CanonicalIPv4Route(networkAddress: address & mask, prefixLength: prefixLength)
-    }
-
-    private func isIPv6Address(_ value: String) -> Bool {
-        var addr6 = in6_addr()
-        return value.withCString { ptr in
-            inet_pton(AF_INET6, ptr, &addr6) == 1
-        }
     }
 
     private func parseGatewayAndInterface(_ output: String) -> (gateway: String?, interfaceName: String?) {

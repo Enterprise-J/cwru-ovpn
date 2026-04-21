@@ -24,14 +24,18 @@ enum CLICommand {
 }
 
 enum CLIError: LocalizedError {
+    case missingConfigFile
     case missingConfig
     case missingValue(String)
     case unexpectedArgument(String)
     case invalidVerbosity(String)
     case invalidTunnelMode(String)
+    case invalidPID(String)
 
     var errorDescription: String? {
         switch self {
+        case .missingConfigFile:
+            return "No config file was found. Create ~/.cwru-ovpn/config.json or pass --config PATH."
         case .missingConfig:
             return "No VPN profile path is configured. Set `profilePath` in the config file."
         case .missingValue(let argument):
@@ -42,6 +46,8 @@ enum CLIError: LocalizedError {
             return "Invalid verbosity '\(value)'. Use silent, daily, or debug."
         case .invalidTunnelMode(let value):
             return "Invalid tunnel mode '\(value)'. Use split or full."
+        case .invalidPID(let value):
+            return "Invalid PID '\(value)'."
         }
     }
 }
@@ -201,8 +207,9 @@ enum CLI {
                     guard nextIndex < arguments.count else {
                         throw CLIError.missingValue(argument)
                     }
-                    guard let parsed = Int32(arguments[nextIndex]) else {
-                        throw CLIError.unexpectedArgument(arguments[nextIndex])
+                    guard let parsed = Int32(arguments[nextIndex]),
+                          parsed > 1 else {
+                        throw CLIError.invalidPID(arguments[nextIndex])
                     }
                     parentPID = parsed
                     index += 2
@@ -313,7 +320,7 @@ enum CLI {
           --config PATH        Path to the config JSON file
           --verbosity LEVEL    Logging level: silent, daily, debug (default: daily)
           --mode MODE          Tunnel mode: full or split (default from config)
-          --allow-sleep        Do not prevent idle sleep while connected
+          --allow-sleep        Allow idle sleep for this run
           --foreground         Keep the controller attached to the terminal
 
         Setup options:
@@ -331,6 +338,10 @@ enum CLI {
           ovpnsplit    Connect in split-tunnel mode
           ovpnd        Disconnect the current session
           ovpnstatus   Show the current status
+
+        Internal helper commands (not for interactive use):
+          install-shell-integration   Update the managed shell block (used by setup.sh)
+          cleanup-watchdog            Restore routes and DNS after controller exit
         """)
     }
 }

@@ -7,18 +7,23 @@ enum RuntimePaths {
         case sudoUserWhenAvailable
     }
 
+    private static let resolutionLock = NSLock()
+    nonisolated(unsafe) private static var cachedStateDirectories: [String: URL] = [:]
+    nonisolated(unsafe) private static var cachedSessionStateDirectories: [String: URL] = [:]
+
     static var homeStateDirectory: URL {
-        if let rawValue = getenv("CWRU_OVPN_HOME_STATE_DIR") {
-            let overridden = String(cString: rawValue)
+        if getuid() != 0,
+           let raw = getenv("CWRU_OVPN_HOME_STATE_DIR") {
+            let overridden = String(cString: raw)
             if !overridden.isEmpty {
                 return URL(fileURLWithPath: overridden, isDirectory: true).standardized
             }
         }
-
-        if let overridden = ProcessInfo.processInfo.environment["CWRU_OVPN_HOME_STATE_DIR"], !overridden.isEmpty {
-            return URL(fileURLWithPath: overridden, isDirectory: true).standardized
-        }
         return resolvedHomeDirectory().appendingPathComponent(AppIdentity.stateDirectoryName, isDirectory: true)
+    }
+
+    static var userHomeDirectory: URL {
+        resolvedHomeDirectory()
     }
 
     static var homeConfigFile: URL {
@@ -29,12 +34,25 @@ enum RuntimePaths {
         homeStateDirectory.appendingPathComponent("profile.ovpn")
     }
 
+    static var privilegedExecutableDirectory: URL {
+        URL(fileURLWithPath: "/Library/PrivilegedHelperTools", isDirectory: true)
+            .appendingPathComponent("cwru-ovpn", isDirectory: true)
+    }
+
+    static var privilegedExecutable: URL {
+        privilegedExecutableDirectory.appendingPathComponent(AppIdentity.executableName)
+    }
+
     static var stateDirectory: URL {
-        resolveStateDirectory()
+        cachedDirectory(cache: &cachedStateDirectories,
+                        key: "state:\(getuid()):\(homeStateDirectory.path)",
+                        resolver: resolveStateDirectory)
     }
 
     static var sessionStateDirectory: URL {
-        resolveSessionStateDirectory()
+        cachedDirectory(cache: &cachedSessionStateDirectories,
+                        key: "session:\(getuid()):\(homeStateDirectory.path)",
+                        resolver: resolveSessionStateDirectory)
     }
 
     static var sessionStateFile: URL {
@@ -45,8 +63,63 @@ enum RuntimePaths {
         stateDirectory.appendingPathComponent("events.ndjson")
     }
 
-    static var legacySessionStateFile: URL {
+    static var homeSessionStateFile: URL {
         homeStateDirectory.appendingPathComponent("session.json")
+    }
+
+    static func createTemporaryFile(prefix: String) throws -> URL {
+        let directory: URL
+        let secureFileAtURL: (URL) throws -> Void
+
+        if getuid() == 0 {
+            try ensureSessionStateDirectory()
+            directory = sessionStateDirectory
+            secureFileAtURL = secureSessionStateFile(at:)
+        } else {
+            try ensureStateDirectory()
+            directory = stateDirectory
+            secureFileAtURL = secureFile(at:)
+        }
+
+        var template = Array(directory
+            .appendingPathComponent("\(prefix).XXXXXX")
+            .path
+            .utf8CString)
+        let fd = template.withUnsafeMutableBufferPointer { buffer -> Int32 in
+            guard let baseAddress = buffer.baseAddress else {
+                return -1
+            }
+            return mkstemp(baseAddress)
+        }
+        let createError = errno
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: createError) ?? .EIO)
+        }
+
+        guard fchmod(fd, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+            let chmodError = errno
+            close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: chmodError) ?? .EIO)
+        }
+
+        guard close(fd) == 0 else {
+            let closeError = errno
+            throw POSIXError(POSIXErrorCode(rawValue: closeError) ?? .EIO)
+        }
+
+        let path = template.withUnsafeBufferPointer { buffer -> String in
+            guard let baseAddress = buffer.baseAddress else {
+                return ""
+            }
+            return String(cString: baseAddress)
+        }
+        guard !path.isEmpty else {
+            throw POSIXError(.EIO)
+        }
+
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        try secureFileAtURL(url)
+        return url
     }
 
     static func ensureStateDirectory() throws {
@@ -87,7 +160,9 @@ enum RuntimePaths {
 
     private static func resolvedHomeDirectory() -> URL {
         let environment = ProcessInfo.processInfo.environment
-        if let sudoUser = environment["SUDO_USER"],
+        if getuid() == 0,
+           let sudoUser = environment["SUDO_USER"],
+           !sudoUser.isEmpty,
            let homePath = NSHomeDirectoryForUser(sudoUser) {
             return URL(fileURLWithPath: homePath, isDirectory: true)
         }
@@ -106,6 +181,21 @@ enum RuntimePaths {
         }
 
         return homeCandidate
+    }
+
+    private static func cachedDirectory(cache: inout [String: URL],
+                                        key: String,
+                                        resolver: () -> URL) -> URL {
+        resolutionLock.lock()
+        defer { resolutionLock.unlock() }
+
+        if let cached = cache[key] {
+            return cached
+        }
+
+        let resolved = resolver()
+        cache[key] = resolved
+        return resolved
     }
 
     private static func resolveSessionStateDirectory() -> URL {
@@ -163,11 +253,14 @@ enum RuntimePaths {
     private static func applySecurityAttributes(to url: URL,
                                                 permissions: Int,
                                                 ownershipPolicy: OwnershipPolicy) throws {
+        try assertNotSymbolicLink(at: url)
+
         var attributes: [FileAttributeKey: Any] = [
             .posixPermissions: permissions
         ]
 
-        if ownershipPolicy == .sudoUserWhenAvailable {
+        if ownershipPolicy == .sudoUserWhenAvailable,
+           getuid() == 0 {
             let environment = ProcessInfo.processInfo.environment
             if let sudoUID = environment["SUDO_UID"].flatMap(Int.init),
                let sudoGID = environment["SUDO_GID"].flatMap(Int.init) {
@@ -177,5 +270,20 @@ enum RuntimePaths {
         }
 
         try FileManager.default.setAttributes(attributes, ofItemAtPath: url.path)
+    }
+
+    private static func assertNotSymbolicLink(at url: URL) throws {
+        var fileInfo = stat()
+        let result = lstat(url.path, &fileInfo)
+        let lstatError = errno
+        guard result == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: lstatError) ?? .EIO)
+        }
+
+        guard (fileInfo.st_mode & S_IFMT) != S_IFLNK else {
+            throw NSError(domain: NSPOSIXErrorDomain,
+                          code: Int(ELOOP),
+                          userInfo: [NSLocalizedDescriptionKey: "Refusing to use a symbolic link for \(url.path)."])
+        }
     }
 }

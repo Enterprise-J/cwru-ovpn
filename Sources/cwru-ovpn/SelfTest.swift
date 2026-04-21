@@ -19,7 +19,10 @@ enum SelfTest {
         try testReachabilityProbeConfig()
         try testAllowSleepConfig()
         try testLegacyConfigKeys()
+        try testLenientSplitTunnelDecoding()
+        try testMissingConfigErrors()
         try testRuntimeValidationHardening()
+        try testWebAuthRequestValidation()
         try testCLIConnectModes()
         try testCLIAdvancedOptions()
         try testGeneratedSudoers()
@@ -29,9 +32,17 @@ enum SelfTest {
         try testReverseResolverZoneDerivation()
         try testDetachedStartupStatus()
         try testShellIntegrationBlocks()
+        try testPhysicalDNSCapture()
         try testMockedSplitTunnelFlow()
+        try testSplitTunnelRejectsLeakyDefaultDNS()
         try testMockedFullTunnelModeSwitch()
+        try testMockedFullTunnelDNSFallsBackToPushedResolvers()
+        try testModeSwitchWaitState()
+        try testSessionStateSavePreservesPendingModeSwitch()
+        try testPlainTopLevelErrorOutput()
         try testMockedStaleStateRecovery()
+        try testStaleCleanupWithoutConfigFile()
+        try testCleanupWatchdogValidation()
         print("Self-test passed.")
     }
 
@@ -119,7 +130,7 @@ enum SelfTest {
             """
             {
               "defaultProfilePath": "~/.cwru-ovpn/profile.ovpn",
-              "allowIdleSleep": true,
+              "allowIdleSleep": false,
               "splitTunnel": {
                 "includedRoutes": [],
                 "resolverDomains": [],
@@ -131,9 +142,49 @@ enum SelfTest {
 
         let legacyConfig = try JSONDecoder().decode(AppConfig.self, from: legacyData)
         try expect(legacyConfig.profilePath == "~/.cwru-ovpn/profile.ovpn",
-                   "Legacy defaultProfilePath should keep decoding for existing installs.")
-        try expect(legacyConfig.allowSleep,
-                   "Legacy allowIdleSleep should keep decoding for existing installs.")
+                   "Legacy defaultProfilePath should still decode.")
+        try expect(!legacyConfig.allowSleep,
+                   "Legacy allowIdleSleep should still decode.")
+    }
+
+    private static func testLenientSplitTunnelDecoding() throws {
+        let emptySplitTunnelData = Data(
+            """
+            {
+              "splitTunnel": {}
+            }
+            """.utf8
+        )
+
+        let decoded = try JSONDecoder().decode(AppConfig.self, from: emptySplitTunnelData)
+        try expect(decoded.splitTunnel.includedRoutes.isEmpty,
+                   "splitTunnel.includedRoutes should default to an empty array when omitted.")
+        try expect(decoded.splitTunnel.resolverDomains.isEmpty,
+                   "splitTunnel.resolverDomains should default to an empty array when omitted.")
+        try expect(decoded.splitTunnel.resolverNameServers.isEmpty,
+                   "splitTunnel.resolverNameServers should default to an empty array when omitted.")
+    }
+
+    private static func testMissingConfigErrors() throws {
+        let isolatedDirectory = temporaryDirectory(named: "cwru-ovpn-config-isolation")
+        defer { try? FileManager.default.removeItem(at: isolatedDirectory) }
+
+        try withCurrentDirectory(isolatedDirectory.path) {
+            try withEnvironmentVariable("CWRU_OVPN_HOME_STATE_DIR", value: isolatedDirectory.appendingPathComponent("state", isDirectory: true).path) {
+                do {
+                    _ = try AppConfig.fallback.resolvedProfilePath(explicitConfigPath: nil)
+                    throw SelfTestError.failed("Missing config files should raise a dedicated error.")
+                } catch CLIError.missingConfigFile {
+                }
+            }
+        }
+
+        let temporaryConfigPath = "/tmp/cwru-ovpn-config.json"
+        do {
+            _ = try AppConfig.fallback.resolvedProfilePath(explicitConfigPath: temporaryConfigPath)
+            throw SelfTestError.failed("Configs without profilePath should still report a missing profile path.")
+        } catch CLIError.missingConfig {
+        }
     }
 
     private static func testCLIConnectModes() throws {
@@ -147,7 +198,7 @@ enum SelfTest {
         switch try CLI.parse(arguments: ["connect"]) {
         case .connect(_, _, _, let allowSleep, let foregroundRequested, let backgroundChild, let startupStatusFilePath):
             try expect(!allowSleep,
-                       "connect should keep preventing idle sleep by default.")
+                       "connect should leave the per-run allowSleep override unset when the flag is omitted.")
             try expect(!foregroundRequested,
                        "connect should detach from the terminal by default.")
             try expect(!backgroundChild,
@@ -161,7 +212,7 @@ enum SelfTest {
         switch try CLI.parse(arguments: ["connect", "--foreground"]) {
         case .connect(_, _, _, let allowSleep, let foregroundRequested, let backgroundChild, let startupStatusFilePath):
             try expect(!allowSleep,
-                       "connect --foreground should not change idle sleep behavior.")
+                       "connect --foreground should not toggle the per-run allowSleep override.")
             try expect(foregroundRequested,
                        "connect --foreground should honor --foreground.")
             try expect(!backgroundChild,
@@ -247,6 +298,14 @@ enum SelfTest {
             throw SelfTestError.failed("install-shell-integration should parse as the helper command.")
         }
 
+        switch try CLI.parse(arguments: ["cleanup-watchdog", "--parent-pid", "42"]) {
+        case .cleanupWatchdog(let parentPID):
+            try expect(parentPID == 42,
+                       "cleanup-watchdog should accept internal parent PIDs greater than 1.")
+        default:
+            throw SelfTestError.failed("cleanup-watchdog should parse as the internal helper command.")
+        }
+
         try expectRejectsUnexpectedArgument(["--config", "/tmp/config.json"],
                                             command: "bare invocation",
                                             argument: "--config")
@@ -265,29 +324,36 @@ enum SelfTest {
         try expectRejectsUnexpectedArgument(["uninstall", "--config", "/tmp/config.json"],
                                             command: "uninstall",
                                             argument: "--config")
+        try expectRejectsInvalidPID(["cleanup-watchdog", "--parent-pid", "1"],
+                                    command: "cleanup-watchdog",
+                                    pid: "1")
     }
 
     private static func testGeneratedSudoers() throws {
         let username = "codex"
-        let executablePath = "/tmp/cwru-ovpn"
+        let executablePath = "/bin/ls"
+        let executableDigest = try Setup.executableSHA256(at: executablePath)
         let sudoers = Setup.renderSudoers(username: username,
-                                          executablePath: executablePath)
+                                          executablePath: executablePath,
+                                          executableDigest: executableDigest)
 
-        let lines = sudoers.split(separator: "\n")
-        try expect(lines.count == 23,
-                   "Generated sudoers should cover the standard connect combinations plus disconnect (plain, -f, and --force), status, and plain setup.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: \(executablePath) connect --allow-sleep"),
+        let lines = sudoers.split(separator: "\n").map(String.init)
+        try expect(lines.count == 22,
+                   "Generated sudoers should cover the standard connect combinations plus disconnect (plain, -f, and --force) and plain setup.")
+        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) connect --allow-sleep"),
                    "Generated sudoers should include the allow-sleep connect variant.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: \(executablePath) disconnect"),
+        try expect(!lines.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) connect --foreground"),
+                   "Generated sudoers should not grant passwordless connect --foreground without the matching debug flag.")
+        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect"),
                    "Generated sudoers should allow disconnect without requiring a config flag.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: \(executablePath) disconnect -f"),
+        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect -f"),
                    "Generated sudoers should allow disconnect -f for shell-friendly force disconnects.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: \(executablePath) disconnect --force"),
+        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect --force"),
                    "Generated sudoers should allow disconnect --force for stuck sessions.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: \(executablePath) status"),
-                   "Generated sudoers should allow status without requiring a config flag.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: \(executablePath) setup"),
+        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) setup"),
                    "Generated sudoers should allow plain setup.")
+        try expect(!sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) status"),
+                   "Generated sudoers should not grant passwordless access to status.")
         try expect(!sudoers.contains("--config"),
                    "Generated sudoers should not depend on a config path.")
         try expect(!sudoers.contains("setup --profile"),
@@ -314,12 +380,41 @@ enum SelfTest {
                    "Expected resolver domains should validate.")
         try expect(!AppConfig.SplitTunnelConfiguration.isValidDomainName("case.edu/../../etc"),
                    "Path-like resolver domains should be rejected.")
+        let currentStartTime = processStartTime(getpid())
+        try expect(currentStartTime != nil,
+                   "Current-process start times should be readable for PID validation.")
+        try expect(processMatchesExecutable(getpid(),
+                                           expectedExecutablePath: CommandLine.arguments[0],
+                                           expectedStartTime: currentStartTime),
+                   "PID validation should accept the current process when the executable path and start time both match.")
+        try withEnvironmentVariable("SUDO_USER", value: "root") {
+            let expanded = AppConfig.expandUserPath("~/profile.ovpn")
+            try expect(!expanded.hasPrefix("/var/root/"),
+                       "Non-root runs should ignore spoofed SUDO_USER values when expanding ~ paths.")
+        }
+    }
+
+    private static func testWebAuthRequestValidation() throws {
+        let embeddedRequest = WebAuthRequest.parse(info: "WEB_AUTH::https://cwru.openvpn.com/connect")
+        try expect(embeddedRequest?.url.host == "cwru.openvpn.com",
+                   "Embedded WebAuth should accept the expected OpenVPN host.")
+        try expect(embeddedRequest?.url.absoluteString.contains("embedded=true") == true,
+                   "Embedded WebAuth should append embedded=true to the query string.")
+        try expect(WebAuthRequest.parse(info: "WEB_AUTH::http://cwru.openvpn.com/connect") == nil,
+                   "WebAuth should reject non-HTTPS URLs.")
+        try expect(WebAuthRequest.parse(info: "WEB_AUTH::https://evil.example/connect") == nil,
+                   "WebAuth should reject unexpected hosts.")
+
+        let externalRequest = WebAuthRequest.parse(info: "OPEN_URL:https://login.case.edu/sso")
+        try expect(externalRequest?.url.host == "login.case.edu",
+                   "External WebAuth should accept case.edu sign-in hosts.")
     }
 
     private static func testRecoveryState() throws {
         var session = SessionState(
             pid: 100,
             executablePath: nil,
+            processStartTime: nil,
             phase: .disconnecting,
             profilePath: "/tmp/profile.ovpn",
             configFilePath: "/tmp/config.json",
@@ -422,11 +517,14 @@ enum SelfTest {
                    "Detached startup status should decode the failure state.")
         try expect(loaded?.message == "Profile missing.",
                    "Detached startup status should preserve the failure message.")
+        let permissions = (try FileManager.default.attributesOfItem(atPath: tempURL.path)[.posixPermissions] as? NSNumber)?.intValue ?? -1
+        try expect(permissions & 0o077 == 0,
+                   "Detached startup status should stay owner-only after atomic writes.")
     }
 
     private static func testShellIntegrationBlocks() throws {
         let legacyHelperPath = "/tmp/repo/scripts/cwru-ovpn.zsh"
-        let installedHelperPath = "/Users/test/.cwru-ovpn/cwru-ovpn.zsh"
+        let installedHelperPath = "/Users/test/My Tools/.cwru-ovpn/cwru-ovpn.zsh"
         let initialContent = """
         export PATH="/usr/local/bin:$PATH"
 
@@ -438,8 +536,8 @@ enum SelfTest {
         let installedContent = ShellIntegration.installBlock(into: initialContent,
                                                              helperPath: installedHelperPath,
                                                              legacySourcePaths: [legacyHelperPath])
-        try expect(installedContent.contains("source \(installedHelperPath)"),
-                   "Shell integration should point marker blocks at the installed helper.")
+        try expect(installedContent.contains("source '/Users/test/My Tools/.cwru-ovpn/cwru-ovpn.zsh'"),
+                   "Shell integration should quote helper paths safely in shell rc files.")
         try expect(!installedContent.contains(legacyHelperPath),
                    "Shell integration should replace legacy repo-local helper paths.")
 
@@ -485,6 +583,8 @@ enum SelfTest {
                                     physicalDNSServers: ["1.1.1.1"],
                                     physicalSearchDomains: ["home"],
                                     ipv6Mode: "Automatic",
+                                    activeDefaultDNSServers: ["129.22.4.32"],
+                                    activeDefaultSearchDomains: ["case.edu"],
                                     tunnelInterfaces: ["utun7"])
 
         try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
@@ -508,6 +608,89 @@ enum SelfTest {
                    "Applying split tunnel should add the lower-half default route override.")
         try expect(mockSystem.recordedCommands.contains("/sbin/route -n add -net 129.22.0.0/16 -interface utun7"),
                    "Applying split tunnel should route included CIDRs through the tunnel interface.")
+        try expect(mockSystem.recordedCommands.contains("/usr/sbin/scutil --dns"),
+                   "Applying split tunnel should verify that the active default resolver is not using VPN DNS.")
+    }
+
+    private static func testPhysicalDNSCapture() throws {
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    tunnelInterfaces: ["utun7"])
+
+        try Shell.withTestHook({ try mockSystem.handle($0) }) {
+            let captured = try RouteManager(configuration: configuration).capturePhysicalDNSConfiguration(for: "en0")
+            try expect(captured?.serviceName == "Wi-Fi",
+                       "Physical DNS capture should resolve the active macOS network service name.")
+            try expect(captured?.dnsServers == ["1.1.1.1"],
+                       "Physical DNS capture should read the original DNS servers.")
+            try expect(captured?.searchDomains == ["home"],
+                       "Physical DNS capture should read the original search domains.")
+            try expect(captured?.ipv6Mode == "Automatic",
+                       "Physical DNS capture should read the original IPv6 mode.")
+        }
+    }
+
+    private static func testSplitTunnelRejectsLeakyDefaultDNS() throws {
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-leaky-dns")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        var session = makeSessionState(
+            pid: 1003,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        session.pushedDNSServers = ["129.22.4.32"]
+        session.pushedSearchDomains = ["case.edu"]
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    activeDefaultDNSServers: ["129.22.4.32"],
+                                    activeDefaultSearchDomains: ["case.edu"],
+                                    tunnelInterfaces: ["utun7"],
+                                    dnsCacheFlushAppliesDNSConfiguration: false)
+
+        try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+            do {
+                try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                    try RouteManager(configuration: configuration).applySplitTunnel(using: &session)
+                }
+                throw SelfTestError.failed("Split tunnel should fail closed when the active default resolver stays on VPN DNS.")
+            } catch RouteManagerError.failedToIsolateSplitTunnelDNS {
+                try expect(!session.routesApplied,
+                           "Split tunnel should leave routesApplied false after failing closed on leaky default DNS.")
+            }
+        }
     }
 
     private static func testMockedFullTunnelModeSwitch() throws {
@@ -552,7 +735,8 @@ enum SelfTest {
                                         physicalDNSServers: ["1.1.1.1"],
                                         physicalSearchDomains: ["home"],
                                         ipv6Mode: "Automatic",
-                                        tunnelInterfaces: ["utun7"])
+                                        tunnelInterfaces: ["utun7"],
+                                        blockedIPv6ProbeDestinations: ["2001:4860:4860::8888", "3000::1"])
 
             try Shell.withTestHook({ try mockSystem.handle($0) }) {
                 try RouteManager(configuration: configuration).switchToFullTunnel(
@@ -568,7 +752,165 @@ enum SelfTest {
                        "Switching to full tunnel should clear split-tunnel route state.")
             try expect(!FileManager.default.fileExists(atPath: ResolverPaths.fileURL(for: "case.edu").path),
                        "Switching to full tunnel should remove split-tunnel scoped resolver files.")
+            try expect(mockSystem.recordedCommands.contains("/sbin/route -n get -inet6 2001:4860:4860::8888"),
+                       "Switching to full tunnel should validate that public IPv6 no longer leaves through the physical interface.")
         }
+    }
+
+    private static func testMockedFullTunnelDNSFallsBackToPushedResolvers() throws {
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-full-dns")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        var session = makeSessionState(
+            pid: 1003,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        session.appliedIncludedRoutes = ["129.22.0.0/16"]
+        session.appliedResolverDomains = ["case.edu", "22.129.in-addr.arpa"]
+        session.pushedDNSServers = ["10.8.0.2"]
+        session.pushedSearchDomains = ["case.edu"]
+        session.fullTunnelDNSServers = []
+        session.fullTunnelSearchDomains = []
+
+        try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+            try FileManager.default.createDirectory(at: resolverDirectory, withIntermediateDirectories: true)
+            try "nameserver 129.22.4.32\ndomain case.edu\nsearch_order 1\n".write(to: ResolverPaths.fileURL(for: "case.edu"),
+                                                                                     atomically: true,
+                                                                                     encoding: .utf8)
+
+            let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                        physicalGateway: "192.168.1.1",
+                                        physicalInterface: "en0",
+                                        physicalDNSServers: ["1.1.1.1"],
+                                        physicalSearchDomains: ["home"],
+                                        ipv6Mode: "Automatic",
+                                        tunnelInterfaces: ["utun7"],
+                                        blockedIPv6ProbeDestinations: ["2001:4860:4860::8888", "3000::1"])
+
+            try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                try RouteManager(configuration: configuration).switchToFullTunnel(
+                    using: &session,
+                    fullTunnelRoutes: [
+                        ManagedIPv4Route(destination: "0.0.0.0/1", nextHopKind: .interface, nextHopValue: "utun7"),
+                        ManagedIPv4Route(destination: "128.0.0.0/1", nextHopKind: .interface, nextHopValue: "utun7"),
+                    ]
+                )
+            }
+
+            try expect(mockSystem.recordedCommands.contains("/usr/sbin/networksetup -setdnsservers Wi-Fi 10.8.0.2"),
+                       "Full tunnel should fall back to pushed VPN DNS when the captured DNS snapshot is empty.")
+            try expect(mockSystem.recordedCommands.contains("/usr/sbin/networksetup -setsearchdomains Wi-Fi case.edu"),
+                       "Full tunnel should fall back to pushed VPN search domains when the captured DNS snapshot is empty.")
+            try expect(session.fullTunnelDNSServers == ["10.8.0.2"],
+                       "Full tunnel should persist the effective VPN DNS servers after falling back from an empty snapshot.")
+            try expect(session.fullTunnelSearchDomains == ["case.edu"],
+                       "Full tunnel should persist the effective VPN search domains after falling back from an empty snapshot.")
+        }
+    }
+
+    private static func testModeSwitchWaitState() throws {
+        var failedSession = makeSessionState(
+            pid: 1004,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        failedSession.lastInfo = "Mode switch to full-tunnel failed: Failed to secure full-tunnel IPv6 traffic."
+
+        switch VPNController.evaluateModeSwitchWaitState(session: failedSession,
+                                                         pid: failedSession.pid,
+                                                         targetMode: .full,
+                                                         sawRequestedMode: true) {
+        case .failed(let message):
+            try expect(message == "Mode switch to full-tunnel failed: Failed to secure full-tunnel IPv6 traffic.",
+                       "Mode switch waits should surface the persisted switch failure as soon as the request clears.")
+        default:
+            throw SelfTestError.failed("Mode switch waits should not keep waiting after a failed in-place switch.")
+        }
+
+        var completedSession = failedSession
+        completedSession.tunnelMode = .full
+        completedSession.lastInfo = nil
+
+        switch VPNController.evaluateModeSwitchWaitState(session: completedSession,
+                                                         pid: completedSession.pid,
+                                                         targetMode: .full,
+                                                         sawRequestedMode: true) {
+        case .succeeded:
+            break
+        default:
+            throw SelfTestError.failed("Mode switch waits should finish once the persisted session reaches the target mode.")
+        }
+    }
+
+    private static func testSessionStateSavePreservesPendingModeSwitch() throws {
+        let currentSession = makeSessionState(
+            pid: 1005,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+
+        var persistedSession = currentSession
+        persistedSession.requestedTunnelMode = .full
+
+        let preservedSession = VPNController.sessionStateForSave(currentState: currentSession,
+                                                                 persistedState: persistedSession)
+        try expect(preservedSession.requestedTunnelMode == .full,
+                   "Routine controller saves should preserve a pending CLI mode switch until the signal handler consumes it.")
+
+        let intentionallyClearedSession = VPNController.sessionStateForSave(currentState: currentSession,
+                                                                            persistedState: persistedSession,
+                                                                            preservingPendingModeSwitch: false)
+        try expect(intentionallyClearedSession.requestedTunnelMode == nil,
+                   "Explicit switch completion saves should still be able to clear a pending mode switch.")
+
+        var satisfiedSession = currentSession
+        satisfiedSession.tunnelMode = .full
+
+        let alreadySatisfiedSession = VPNController.sessionStateForSave(currentState: satisfiedSession,
+                                                                        persistedState: persistedSession)
+        try expect(alreadySatisfiedSession.requestedTunnelMode == nil,
+                   "Routine saves should not resurrect a pending mode switch after the target mode is already active.")
+    }
+
+    private static func testPlainTopLevelErrorOutput() throws {
+        let rendered = renderUserFacingError(SelfTestError.failed("Browser sign-in was cancelled."))
+        try expect(rendered == "Browser sign-in was cancelled.\n",
+                   "Top-level error output should preserve the plain user-facing message.")
     }
 
     private static func testMockedStaleStateRecovery() throws {
@@ -587,9 +929,10 @@ enum SelfTest {
 
         try withEnvironmentVariable("CWRU_OVPN_HOME_STATE_DIR", value: homeStateDirectory.path) {
             try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
-                let profileURL = RuntimePaths.homeProfileFile
+                let profileURL = URL(fileURLWithPath: "/private/tmp/cwru-ovpn-stale-profile-\(UUID().uuidString).ovpn")
                 let configURL = RuntimePaths.homeConfigFile
                 try FileManager.default.createDirectory(at: RuntimePaths.homeStateDirectory, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: profileURL) }
                 try "".write(to: profileURL, atomically: true, encoding: .utf8)
                 try """
                 {
@@ -640,6 +983,115 @@ enum SelfTest {
         }
     }
 
+    private static func testStaleCleanupWithoutConfigFile() throws {
+        let homeStateDirectory = temporaryDirectory(named: "cwru-ovpn-home-state-missing-config")
+        defer { try? FileManager.default.removeItem(at: homeStateDirectory) }
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-missing-config")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    tunnelInterfaces: ["utun7"])
+
+        try withEnvironmentVariable("CWRU_OVPN_HOME_STATE_DIR", value: homeStateDirectory.path) {
+            try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+                let profileURL = URL(fileURLWithPath: "/private/tmp/cwru-ovpn-missing-config-\(UUID().uuidString).ovpn")
+                defer { try? FileManager.default.removeItem(at: profileURL) }
+                try FileManager.default.createDirectory(at: RuntimePaths.homeStateDirectory, withIntermediateDirectories: true)
+                try "".write(to: profileURL, atomically: true, encoding: .utf8)
+
+                var session = makeSessionState(
+                    pid: Int32.max - 11,
+                    profilePath: profileURL.path,
+                    configFilePath: "/private/tmp/does-not-exist.json",
+                    physicalGateway: "192.168.1.1",
+                    physicalInterface: "en0",
+                    physicalServiceName: "Wi-Fi",
+                    originalDNSServers: ["1.1.1.1"],
+                    originalSearchDomains: ["home"],
+                    originalIPv6Mode: "Automatic",
+                    tunName: "utun7",
+                    tunnelMode: .split,
+                    cleanupNeeded: true
+                )
+                session.appliedIncludedRoutes = ["129.22.0.0/16"]
+                session.appliedResolverDomains = ["case.edu", "22.129.in-addr.arpa"]
+                try session.save()
+
+                try FileManager.default.createDirectory(at: resolverDirectory, withIntermediateDirectories: true)
+                try "nameserver 129.22.4.32\ndomain case.edu\nsearch_order 1\n".write(to: ResolverPaths.fileURL(for: "case.edu"),
+                                                                                         atomically: true,
+                                                                                         encoding: .utf8)
+
+                try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                    try VPNController.disconnectExistingSession(force: false)
+                }
+
+                try expect(SessionState.load() == nil,
+                           "Stale cleanup should not depend on the config file still existing.")
+                try expect(!FileManager.default.fileExists(atPath: ResolverPaths.fileURL(for: "case.edu").path),
+                           "Stale cleanup without a config file should still remove scoped resolver files.")
+            }
+        }
+    }
+
+    private static func testCleanupWatchdogValidation() throws {
+        let homeStateDirectory = temporaryDirectory(named: "cwru-ovpn-watchdog-state")
+        defer { try? FileManager.default.removeItem(at: homeStateDirectory) }
+
+        try withEnvironmentVariable("CWRU_OVPN_HOME_STATE_DIR", value: homeStateDirectory.path) {
+            try withEnvironmentVariable("CWRU_OVPN_SUPPRESS_USER_ALERTS", value: "1") {
+                let profileURL = URL(fileURLWithPath: "/private/tmp/cwru-ovpn-watchdog-profile.ovpn")
+                let configURL = RuntimePaths.homeConfigFile
+                try FileManager.default.createDirectory(at: RuntimePaths.homeStateDirectory, withIntermediateDirectories: true)
+                try """
+                {
+                  "profilePath": "\(profileURL.path)",
+                  "tunnelMode": "split",
+                  "allowSleep": false,
+                  "verbosity": "daily",
+                  "splitTunnel": {
+                    "includedRoutes": [],
+                    "resolverDomains": [],
+                    "resolverNameServers": []
+                  }
+                }
+                """.write(to: configURL, atomically: true, encoding: .utf8)
+
+                var session = makeSessionState(
+                    pid: 4242,
+                    profilePath: profileURL.path,
+                    configFilePath: configURL.path,
+                    physicalGateway: "192.168.1.1",
+                    physicalInterface: "en0",
+                    physicalServiceName: "-Wi-Fi",
+                    originalDNSServers: ["1.1.1.1"],
+                    originalSearchDomains: ["home"],
+                    originalIPv6Mode: "Automatic",
+                    tunName: "utun7",
+                    tunnelMode: .split,
+                    cleanupNeeded: true
+                )
+                session.phase = .disconnecting
+                try session.save()
+
+                CleanupWatchdog.performCleanup(parentPID: session.pid)
+
+                let reloaded = SessionState.load()
+                try expect(reloaded?.phase == .failed,
+                           "Cleanup watchdog should preserve recovery state when validation rejects session data.")
+                try expect(reloaded?.cleanupNeeded == true,
+                           "Cleanup watchdog should keep cleanupNeeded enabled after a failed cleanup attempt.")
+                try expect(reloaded?.lastInfo?.contains("Cleanup watchdog failed") == true,
+                           "Cleanup watchdog should record the validation failure message.")
+            }
+        }
+    }
+
     private static func withEnvironmentVariable<T>(_ name: String,
                                                    value: String,
                                                    body: () throws -> T) throws -> T {
@@ -652,6 +1104,16 @@ enum SelfTest {
                 unsetenv(name)
             }
         }
+        return try body()
+    }
+
+    private static func withCurrentDirectory<T>(_ path: String,
+                                                body: () throws -> T) throws -> T {
+        let previousPath = FileManager.default.currentDirectoryPath
+        guard FileManager.default.changeCurrentDirectoryPath(path) else {
+            throw SelfTestError.failed("Failed to change the current directory for a self-test fixture.")
+        }
+        defer { _ = FileManager.default.changeCurrentDirectoryPath(previousPath) }
         return try body()
     }
 
@@ -677,6 +1139,7 @@ enum SelfTest {
         SessionState(
             pid: pid,
             executablePath: "/tmp/cwru-ovpn",
+            processStartTime: nil,
             phase: .connected,
             profilePath: profilePath,
             configFilePath: configFilePath,
@@ -719,9 +1182,14 @@ enum SelfTest {
         private var defaultInterface: String
         private var dnsServers: [String]
         private var searchDomains: [String]
+        private var activeDefaultDNSServers: [String]
+        private var activeDefaultSearchDomains: [String]
         private var ipv6Mode: String
         private let tunnelInterfaces: Set<String>
+        private let blockedIPv6ProbeDestinations: Set<String>
+        private let dnsCacheFlushAppliesDNSConfiguration: Bool
         private var routes: [RouteRecord]
+        private var ipv6DefaultRoutes: [String: String]
 
         var recordedCommands: [String] = []
 
@@ -731,19 +1199,28 @@ enum SelfTest {
              physicalDNSServers: [String],
              physicalSearchDomains: [String],
              ipv6Mode: String,
-             tunnelInterfaces: Set<String>) {
+             activeDefaultDNSServers: [String]? = nil,
+             activeDefaultSearchDomains: [String]? = nil,
+             tunnelInterfaces: Set<String>,
+             blockedIPv6ProbeDestinations: Set<String> = [],
+             dnsCacheFlushAppliesDNSConfiguration: Bool = true) {
             self.serviceName = serviceName
             self.defaultGateway = physicalGateway
             self.defaultInterface = physicalInterface
             self.dnsServers = physicalDNSServers
             self.searchDomains = physicalSearchDomains
+            self.activeDefaultDNSServers = activeDefaultDNSServers ?? physicalDNSServers
+            self.activeDefaultSearchDomains = activeDefaultSearchDomains ?? physicalSearchDomains
             self.ipv6Mode = ipv6Mode
             self.tunnelInterfaces = tunnelInterfaces
+            self.blockedIPv6ProbeDestinations = blockedIPv6ProbeDestinations
+            self.dnsCacheFlushAppliesDNSConfiguration = dnsCacheFlushAppliesDNSConfiguration
             self.routes = [
                 RouteRecord(destination: "default",
                             gateway: physicalGateway,
                             interfaceName: physicalInterface)
             ]
+            self.ipv6DefaultRoutes = [:]
         }
 
         func handle(_ invocation: ShellInvocation) throws -> ShellResult? {
@@ -756,7 +1233,13 @@ enum SelfTest {
                 return ShellResult(exitCode: 0, stdout: netstatOutput(), stderr: "")
             case "/usr/sbin/networksetup":
                 return handleNetworkSetup(arguments: invocation.arguments)
+            case "/usr/sbin/scutil":
+                return handleScutil(arguments: invocation.arguments)
             case "/usr/bin/dscacheutil", "/usr/bin/killall":
+                if dnsCacheFlushAppliesDNSConfiguration {
+                    activeDefaultDNSServers = dnsServers
+                    activeDefaultSearchDomains = searchDomains
+                }
                 return ShellResult(exitCode: 0, stdout: "", stderr: "")
             case "/bin/mkdir":
                 if invocation.arguments.count == 2, invocation.arguments[0] == "-p" {
@@ -795,6 +1278,18 @@ enum SelfTest {
                                    stderr: "")
             }
 
+            if arguments.count == 4, arguments[0] == "-n", arguments[1] == "get", arguments[2] == "-inet6" {
+                if blockedIPv6ProbeDestinations.contains(arguments[3]) {
+                    return ShellResult(exitCode: 0,
+                                       stdout: "route to: \(arguments[3])\ngateway: ::1\ninterface: lo0\nflags: <UP,GATEWAY,REJECT,DONE,STATIC>\n",
+                                       stderr: "")
+                }
+                let interfaceName = routedIPv6Interface(for: arguments[3])
+                return ShellResult(exitCode: 0,
+                                   stdout: "route to: \(arguments[3])\ngateway: fe80::%\(interfaceName)\ninterface: \(interfaceName)\n",
+                                   stderr: "")
+            }
+
             if arguments.count == 3, arguments[0] == "-n", arguments[1] == "get" {
                 let gateway = arguments[2]
                 return ShellResult(exitCode: 0,
@@ -806,6 +1301,15 @@ enum SelfTest {
                 if arguments[2] == "default", arguments.count >= 4 {
                     defaultGateway = arguments[3]
                     upsertRoute(destination: "default", gateway: defaultGateway, interfaceName: defaultInterface)
+                    return ShellResult(exitCode: 0, stdout: "", stderr: "")
+                }
+
+                if arguments[2] == "-net",
+                   arguments.count >= 8,
+                   arguments[3] == "-inet6" {
+                    let prefixLength = arguments[6]
+                    let interfaceName = arguments.last ?? defaultInterface
+                    ipv6DefaultRoutes["\(arguments[4])/\(prefixLength)"] = interfaceName
                     return ShellResult(exitCode: 0, stdout: "", stderr: "")
                 }
 
@@ -828,6 +1332,14 @@ enum SelfTest {
             if arguments.count >= 3, arguments[0] == "-n", arguments[1] == "delete" {
                 if arguments[2] == "default" {
                     routes.removeAll { $0.destination == "default" }
+                    return ShellResult(exitCode: 0, stdout: "", stderr: "")
+                }
+
+                if arguments[2] == "-net",
+                   arguments.count >= 8,
+                   arguments[3] == "-inet6" {
+                    let prefixLength = arguments[6]
+                    ipv6DefaultRoutes.removeValue(forKey: "\(arguments[4])/\(prefixLength)")
                     return ShellResult(exitCode: 0, stdout: "", stderr: "")
                 }
 
@@ -884,16 +1396,48 @@ enum SelfTest {
                                    stderr: "")
             case "-listnetworkserviceorder":
                 return ShellResult(exitCode: 0,
-                                   stdout: "(1) \(serviceName)\n(Hardware Port: Wi-Fi, Device: \(defaultInterface))\n",
+                                   stdout: """
+                                   An asterisk (*) denotes that a network service is disabled.
+                                   (1) \(serviceName)
+                                   (Hardware Port: Wi-Fi, Device: \(defaultInterface))
+
+                                   """,
                                    stderr: "")
             default:
                 return ShellResult(exitCode: 0, stdout: "", stderr: "")
             }
         }
 
+        private func handleScutil(arguments: [String]) -> ShellResult {
+            guard arguments == ["--dns"] else {
+                return ShellResult(exitCode: 1, stdout: "", stderr: "unsupported scutil command")
+            }
+
+            var lines = ["DNS configuration", "", "resolver #1"]
+            for (index, domain) in activeDefaultSearchDomains.enumerated() {
+                lines.append("  search domain[\(index)] : \(domain)")
+            }
+            for (index, server) in activeDefaultDNSServers.enumerated() {
+                lines.append("  nameserver[\(index)] : \(server)")
+            }
+            lines.append("")
+            lines.append("DNS configuration (for scoped queries)")
+
+            return ShellResult(exitCode: 0,
+                               stdout: lines.joined(separator: "\n") + "\n",
+                               stderr: "")
+        }
+
         private func upsertRoute(destination: String, gateway: String, interfaceName: String) {
             routes.removeAll { $0.destination == destination }
             routes.append(RouteRecord(destination: destination, gateway: gateway, interfaceName: interfaceName))
+        }
+
+        private func routedIPv6Interface(for destination: String) -> String {
+            let trimmed = destination.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let firstNibble = trimmed.first ?? "0"
+            let routeKey = "89abcdef".contains(firstNibble) ? "8000::/1" : "::/1"
+            return ipv6DefaultRoutes[routeKey] ?? defaultInterface
         }
 
         private func netstatOutput() -> String {
@@ -929,6 +1473,20 @@ enum SelfTest {
                        "\(command) should reject \(expectedArgument) as an unexpected argument.")
         } catch {
             throw SelfTestError.failed("\(command) should reject \(expectedArgument) with an unexpected argument error.")
+        }
+    }
+
+    private static func expectRejectsInvalidPID(_ arguments: [String],
+                                                command: String,
+                                                pid: String) throws {
+        do {
+            _ = try CLI.parse(arguments: arguments)
+            throw SelfTestError.failed("\(command) should reject invalid PID \(pid).")
+        } catch CLIError.invalidPID(let value) {
+            try expect(value == pid,
+                       "\(command) should report the invalid PID value.")
+        } catch {
+            throw SelfTestError.failed("\(command) should reject \(pid) with an invalid PID error.")
         }
     }
 }

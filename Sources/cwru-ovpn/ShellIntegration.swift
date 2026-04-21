@@ -44,7 +44,7 @@ enum ShellIntegration {
 
         let block = [
             startMarker,
-            "source \(helperPath)",
+            "source \(shellQuoted(helperPath))",
             endMarker,
         ].joined(separator: "\n") + "\n"
 
@@ -74,7 +74,11 @@ enum ShellIntegration {
                 }
 
                 return !helperPaths.contains(where: {
-                    trimmed == "source \($0)" || trimmed == ". \($0)"
+                    let quotedPath = shellQuoted($0)
+                    return trimmed == "source \($0)"
+                        || trimmed == ". \($0)"
+                        || trimmed == "source \(quotedPath)"
+                        || trimmed == ". \(quotedPath)"
                 })
             }
 
@@ -89,6 +93,10 @@ enum ShellIntegration {
         }
 
         return result.trimmingCharacters(in: CharacterSet(charactersIn: "\n")) + (result.isEmpty ? "" : "\n")
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 
     private static func stripManagedBlock(from content: String) -> String {
@@ -115,7 +123,7 @@ enum ShellIntegration {
     }
 
     private static func preferredRCFile(preferredShellPath: String?) -> URL {
-        let homeDirectory = RuntimePaths.homeStateDirectory.deletingLastPathComponent()
+        let homeDirectory = RuntimePaths.userHomeDirectory
         let shellName = preferredShellPath
             .flatMap { URL(fileURLWithPath: $0).lastPathComponent.isEmpty ? nil : URL(fileURLWithPath: $0).lastPathComponent }
             ?? "zsh"
@@ -135,7 +143,7 @@ enum ShellIntegration {
     }
 
     private static func knownRCFiles() -> [URL] {
-        let homeDirectory = RuntimePaths.homeStateDirectory.deletingLastPathComponent()
+        let homeDirectory = RuntimePaths.userHomeDirectory
         return [
             homeDirectory.appendingPathComponent(".zshrc"),
             homeDirectory.appendingPathComponent(".bashrc"),

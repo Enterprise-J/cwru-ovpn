@@ -1,34 +1,33 @@
 # cwru-ovpn
 
-A native macOS client for Case Western Reserve University OpenVPN profiles, built on the OpenVPN 3 core.
+Native macOS client for Case Western Reserve University OpenVPN profiles, built on OpenVPN 3.
 
-- **Version:** 0.2.0
-- **Requires:** macOS 14 or later
+- **Version:** 0.3.0
+- **Last Updated:** 2026-04-21
+- **Requires:** Apple Silicon Macs with macOS 14 or later
 
 ## Features
 
 - Browser-based authentication against OpenVPN CloudConnexa and CWRU SSO.
-- Full-tunnel and split-tunnel modes, switchable in place without restarting the session.
-- Scoped DNS resolvers and IPv6 leak prevention in split-tunnel mode.
-- Lightweight implementation, no launch daemons or login items.
+- Full- and split-tunnel modes, switchable in place without dropping the session.
+- Scoped DNS resolvers in split-tunnel mode; physical IPv6 disabled for split-tunnel isolation and when full-tunnel safety checks need it.
+- Lightweight implementation. No launch daemons, no login items.
 
 ## Installation
 
+For Intel Macs, see [Build](#build).
+
 1. Sign in at `https://cwru.openvpn.com/` and download a `.ovpn` profile.
-2. Place a single profile at the repository root so `./scripts/setup.sh` can import it automatically, or pass it explicitly with `--profile /path/to/profile.ovpn`.
-3. Run the installer:
+2. Put a single profile at the repository root so `./scripts/setup.sh` can import it automatically, or pass `--profile /path/to/profile.ovpn`.
+3. Run as your normal user:
 
    ```bash
    ./scripts/setup.sh
    ```
 
-`setup.sh` installs shell shortcuts into the current user's `zsh` or `bash` rc file, and `uninstall` removes that managed block automatically.
-
-`./scripts/setup.sh` installs the matching prebuilt binary from `dist/cwru-ovpn-macos<major>` for the current Mac. If that artifact is missing, it falls back to a local `swift build -c release` on the current machine.
+`setup.sh` uses `sudo` only for the privileged install steps. It installs the binary at `/Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn`, writes the shell helper to `~/.cwru-ovpn/cwru-ovpn.zsh`, and updates the current user's `zsh` or `bash` rc file.
 
 ## Usage
-
-These shell helpers are installed by `setup.sh` and wrap the passwordless `sudo` commands configured by `setup`.
 
 | Command | Action |
 | --- | --- |
@@ -37,19 +36,15 @@ These shell helpers are installed by `setup.sh` and wrap the passwordless `sudo`
 | `ovpnstatus` | Print the current connection status |
 | `ovpnd` | Disconnect the current session |
 
+By default, `cwru-ovpn` tries to prevent idle sleep while connected. Pass `--allow-sleep`, or set `allowSleep` to `true` in `config.json`, to let the Mac idle sleep instead.
+
 ## Advanced
 
-Use the binary directly for foreground operation, debug logging, explicit config files, or profile imports. The shell helpers above are thin wrappers around the same command surface.
-
-For commands that change VPN or install state:
+Use the installed binary directly for foreground mode, debug logging, explicit config files, or profile imports.
 
 ```bash
-sudo ~/.cwru-ovpn/bin/cwru-ovpn [command] [options]
+sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn [command] [options]
 ```
-
-Read-only commands such as `status`, `logs`, `doctor`, `version`, and `help` can also be run directly without `sudo`.
-
-Commands:
 
 | Command | Purpose |
 | --- | --- |
@@ -63,41 +58,39 @@ Commands:
 | `version` | Print the version number |
 | `help` | Show the built-in help text |
 
-`connect` options:
-
-| Parameter | Purpose |
+| Syntax | Purpose |
 | --- | --- |
 | `--config PATH` | Use a specific config JSON file |
 | `--verbosity silent\|daily\|debug` | Override the configured log level |
 | `--mode full\|split` | Override the configured tunnel mode |
-| `--allow-sleep` | Allow the Mac to idle sleep |
+| `--allow-sleep` | Allow the Mac to idle sleep for this run |
 | `--foreground` | Keep the controller attached to the terminal |
-
-Other command options:
-
-| Parameter | Purpose |
-| --- | --- |
 | `disconnect --force` | Drop stale state even if cleanup still reports the network as unhealthy; `ovpnd` intentionally does not forward this flag |
 | `logs --tail COUNT` | Show the last `COUNT` event log entries; defaults to `40` |
 | `setup --profile PATH` | Copy a profile to `~/.cwru-ovpn/profile.ovpn` before installing sudoers |
 | `uninstall --purge` | Also remove `~/.cwru-ovpn` after uninstalling shell integration |
 
-When using passwordless `sudo` installed by `setup`, keep argument order in the canonical form shown here.
+Read-only commands such as `status`, `logs`, `doctor`, `version`, and `help` can run without `sudo`.
 
-Foreground debug example:
+Passwordless `sudo` covers the canonical `connect` forms, `disconnect`, `disconnect -f`, `disconnect --force`, and plain `setup`. `connect --config PATH ...`, `connect --foreground` without `--verbosity debug`, and non-canonical argument orders may still prompt for an admin password.
+
+Foreground debug:
 
 ```bash
-sudo ~/.cwru-ovpn/bin/cwru-ovpn connect --config ~/.cwru-ovpn/config.json --verbosity debug --foreground
+sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn connect --config ~/.cwru-ovpn/config.json --verbosity debug --foreground
 tail -n 100 ~/.cwru-ovpn/events.ndjson
 ```
-Note: `events.ndjson` may contain connection metadata and should be treated as sensitive.
 
-For a concise troubleshooting snapshot:
+`events.ndjson` may contain connection metadata; treat it as sensitive.
+
+Troubleshooting:
 
 ```bash
-~/.cwru-ovpn/bin/cwru-ovpn doctor
-~/.cwru-ovpn/bin/cwru-ovpn logs --tail 60
+/Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn doctor
+/Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn logs --tail 100
 ```
+
+`doctor` lists live `utun*` interfaces, which can help explain interrupted cleanup.
 
 ## Configuration
 
@@ -116,57 +109,65 @@ The config file lives at `~/.cwru-ovpn/config.json`. A template is provided at [
 
 ## Build
 
-Install dependencies:
+### Prerequisites
 
 ```bash
 brew install openssl@3 lz4 fmt
-```
-
-Clone the repositories under `~`:
-
-```bash
 git clone https://github.com/OpenVPN/openvpn3 ~/openvpn3
 git clone https://github.com/chriskohlhoff/asio ~/asio
 git clone https://github.com/Enterprise-J/cwru-ovpn.git ~/cwru-ovpn
 cd ~/cwru-ovpn
 ```
 
-Override locations if needed:
-
-```bash
-export OPENVPN3_DIR=~/openvpn3
-export ASIO_DIR=~/asio
-# Optional: allow legacy or non-preferred OpenVPN data-channel algorithms
-export CWRU_OVPN_ENABLE_LEGACY_ALGORITHMS=1
-export CWRU_OVPN_ENABLE_NON_PREFERRED_DC_ALGORITHMS=1
-```
-
-Build from the repository root:
-
-```bash
-swift build --disable-sandbox                  # debug
-swift build -c release --disable-sandbox       # release
-```
-
-Local `swift build` links against the Homebrew-installed dynamic libraries on the current Mac.
-
-To produce versioned release binaries and `dist/SHA256SUMS` for distribution:
-
-```bash
-./scripts/build-release-binaries.sh
-```
-
-If the source archives are missing, fetch them once with:
+If you plan to run `./scripts/build-release-binaries.sh`, fetch the source archives once:
 
 ```bash
 brew fetch --build-from-source openssl@3 lz4 fmt
 ```
 
-Run the repository's validation workflow:
+### Path Overrides
 
 ```bash
+export OPENVPN3_DIR=/path/to/openvpn3
+export ASIO_DIR=/path/to/asio
+export HOMEBREW_PREFIX=/opt/homebrew
+export OPENSSL_PREFIX=/opt/homebrew/opt/openssl@3
+export LZ4_PREFIX=/opt/homebrew/opt/lz4
+export FMT_PREFIX=/opt/homebrew/opt/fmt
+```
+
+Optional build knobs:
+
+```bash
+export CWRU_OVPN_ENABLE_LEGACY_ALGORITHMS=1
+export CWRU_OVPN_ENABLE_NON_PREFERRED_DC_ALGORITHMS=1
+export CWRU_OVPN_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+```
+
+### Common Builds
+
+```bash
+swift build --disable-sandbox
+swift build -c release --disable-sandbox
 ./scripts/test.sh
 ```
+
+`swift build` targets the current macOS major version and links against Homebrew dynamic libraries. Override it with `CWRU_OVPN_MACOS_DEPLOYMENT_TARGET`.
+
+Intel is not a supported install target. If you build on Intel anyway, only the local `./.build/release/cwru-ovpn` output exists.
+
+### Release Artifacts
+
+```bash
+./scripts/build-release-binaries.sh
+```
+
+Run that script from a native Apple Silicon shell. It rebuilds target-specific static OpenSSL, LZ4, and fmt libraries under `.build/third-party`, emits `dist/cwru-ovpn-macos<major>-arm64`, updates `dist/SHA256SUMS`, and signs the binaries if `CWRU_OVPN_CODESIGN_IDENTITY` is set.
+
+### Which Output `setup.sh` Uses
+
+- Apple Silicon: `setup.sh` installs `dist/cwru-ovpn-macos<major>-arm64` when it is present and passes host, checksum, and signature checks. Otherwise it falls back to `./.build/release/cwru-ovpn`.
+- Unsupported hosts: `setup.sh` uses `./.build/release/cwru-ovpn` only.
 
 ## License
 

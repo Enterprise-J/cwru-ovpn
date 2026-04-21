@@ -6,7 +6,8 @@ import PackageDescription
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let workspaceRoot = URL(fileURLWithPath: packageRoot).deletingLastPathComponent().path
 let environment = ProcessInfo.processInfo.environment
-let deploymentTarget = environment["CWRU_OVPN_MACOS_DEPLOYMENT_TARGET"] ?? "14.0"
+let hostDeploymentTarget = "\(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).0"
+let deploymentTarget = environment["CWRU_OVPN_MACOS_DEPLOYMENT_TARGET"] ?? hostDeploymentTarget
 
 func firstExistingPath(_ candidates: [String], label: String) -> String {
     for candidate in candidates where FileManager.default.fileExists(atPath: candidate) {
@@ -33,11 +34,45 @@ func uniquePaths(_ candidates: [String]) -> [String] {
     return result
 }
 
-let homebrewPrefix = environment["HOMEBREW_PREFIX"] ?? "/opt/homebrew"
+func preferredExistingPath(_ candidates: [String], fallback: String) -> String {
+    for candidate in candidates where FileManager.default.fileExists(atPath: candidate) {
+        return candidate
+    }
+
+    return fallback
+}
+
+let homebrewPrefixCandidates = uniquePaths(
+    [
+        environment["HOMEBREW_PREFIX"],
+        "/opt/homebrew",
+        "/usr/local",
+    ].compactMap { $0 }
+)
+let homebrewPrefix = preferredExistingPath(homebrewPrefixCandidates,
+                                           fallback: environment["HOMEBREW_PREFIX"] ?? "/opt/homebrew")
 let thirdPartyPrefix = environment["CWRU_OVPN_THIRD_PARTY_PREFIX"]
-let openSSLPrefix = environment["OPENSSL_PREFIX"] ?? thirdPartyPrefix ?? "\(homebrewPrefix)/opt/openssl@3"
-let lz4Prefix = environment["LZ4_PREFIX"] ?? thirdPartyPrefix ?? "\(homebrewPrefix)/opt/lz4"
-let fmtPrefix = environment["FMT_PREFIX"] ?? thirdPartyPrefix ?? "\(homebrewPrefix)/opt/fmt"
+let openSSLPrefix = preferredExistingPath(
+    [
+        environment["OPENSSL_PREFIX"],
+        thirdPartyPrefix,
+    ].compactMap { $0 } + homebrewPrefixCandidates.map { "\($0)/opt/openssl@3" },
+    fallback: environment["OPENSSL_PREFIX"] ?? thirdPartyPrefix ?? "\(homebrewPrefix)/opt/openssl@3"
+)
+let lz4Prefix = preferredExistingPath(
+    [
+        environment["LZ4_PREFIX"],
+        thirdPartyPrefix,
+    ].compactMap { $0 } + homebrewPrefixCandidates.map { "\($0)/opt/lz4" },
+    fallback: environment["LZ4_PREFIX"] ?? thirdPartyPrefix ?? "\(homebrewPrefix)/opt/lz4"
+)
+let fmtPrefix = preferredExistingPath(
+    [
+        environment["FMT_PREFIX"],
+        thirdPartyPrefix,
+    ].compactMap { $0 } + homebrewPrefixCandidates.map { "\($0)/opt/fmt" },
+    fallback: environment["FMT_PREFIX"] ?? thirdPartyPrefix ?? "\(homebrewPrefix)/opt/fmt"
+)
 let openVPN3Root = firstExistingPath(
     [
         environment["OPENVPN3_DIR"],
@@ -64,6 +99,8 @@ let asioIncludeDir = firstExistingPath(
     label: "the Asio include directory"
 )
 let preferStaticThirdPartyLibraries = environment["CWRU_OVPN_STATIC_THIRD_PARTY"] == "1"
+let enableLegacyAlgorithms = ["1", "true", "TRUE", "yes", "YES"].contains(environment["CWRU_OVPN_ENABLE_LEGACY_ALGORITHMS"] ?? "")
+let enableNonPreferredDCAlgorithms = ["1", "true", "TRUE", "yes", "YES"].contains(environment["CWRU_OVPN_ENABLE_NON_PREFERRED_DC_ALGORITHMS"] ?? "")
 let staticThirdPartyLibraries = [
     "\(openSSLPrefix)/lib/libssl.a",
     "\(openSSLPrefix)/lib/libcrypto.a",
@@ -81,22 +118,21 @@ if preferStaticThirdPartyLibraries && !staticThirdPartyLibraries.allSatisfy({ Fi
         """
     )
 }
-let useStaticThirdPartyLibraries = preferStaticThirdPartyLibraries
 let thirdPartyIncludeDirs = uniquePaths(
     [
         thirdPartyPrefix.map { "\($0)/include" },
         "\(openSSLPrefix)/include",
         "\(lz4Prefix)/include",
         "\(fmtPrefix)/include",
-        "\(homebrewPrefix)/include",
-    ].compactMap { $0 }
+    ].compactMap { $0 } + homebrewPrefixCandidates.map { "\($0)/include" }
 )
-let dynamicLibrarySearchPaths = uniquePaths([
-    "\(homebrewPrefix)/lib",
-    "\(openSSLPrefix)/lib",
-    "\(lz4Prefix)/lib",
-    "\(fmtPrefix)/lib",
-])
+let dynamicLibrarySearchPaths = uniquePaths(
+    homebrewPrefixCandidates.map { "\($0)/lib" } + [
+        "\(openSSLPrefix)/lib",
+        "\(lz4Prefix)/lib",
+        "\(fmtPrefix)/lib",
+    ]
+)
 let wrapperIncludeFlags =
     [
         "-std=c++20",
@@ -117,7 +153,7 @@ let wrapperLinkerSettings: [LinkerSetting] = {
         .linkedFramework("SystemConfiguration"),
     ]
 
-    if useStaticThirdPartyLibraries {
+    if preferStaticThirdPartyLibraries {
         linkerOptions.insert(.unsafeFlags(staticThirdPartyLibraries), at: 0)
     } else {
         linkerOptions.insert(
@@ -155,6 +191,8 @@ let package = Package(
                 .define("USE_ASIO"),
                 .define("HAVE_LZ4"),
                 .define("USE_OPENSSL"),
+                .define("CWRU_OVPN_ENABLE_LEGACY_ALGORITHMS", to: enableLegacyAlgorithms ? "1" : "0"),
+                .define("CWRU_OVPN_ENABLE_NON_PREFERRED_DC_ALGORITHMS", to: enableNonPreferredDCAlgorithms ? "1" : "0"),
             ],
             linkerSettings: wrapperLinkerSettings
         ),
@@ -168,7 +206,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("AuthenticationServices"),
-                .linkedFramework("WebKit"),
+                .linkedFramework("Network"),
             ]
         ),
     ]

@@ -32,6 +32,7 @@ struct DetachedStartupStatus: Codable {
         do {
             let data = try JSONEncoder().encode(payload)
             try data.write(to: url, options: .atomic)
+            try RuntimePaths.secureSessionStateFile(at: url)
         } catch {
             fputs("\(AppIdentity.executableName): failed to write detached startup status: \(error.localizedDescription)\n", stderr)
         }

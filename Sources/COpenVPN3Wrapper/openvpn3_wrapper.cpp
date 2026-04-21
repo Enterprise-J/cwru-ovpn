@@ -1,18 +1,14 @@
 #include "cwru_openvpn3_wrapper.h"
 
-// This file intentionally keeps the OpenVPN 3 touchpoints concentrated in one place.
-// When upstream changes, start by comparing against openvpn3/client/ovpncli.hpp and
-// openvpn3/test/ovpncli/cli.cpp, then update the notes in THIRD_PARTY_NOTICES.md.
+// Keep OpenVPN 3 touchpoints concentrated here.
+// Compare against the upstream ovpncli sources when updating this vendor copy.
 
-#include <atomic>
-#include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 
-#include <client/ovpncli.hpp>
+#include "ovpncli.hpp"
 
 using openvpn::ClientAPI::AppCustomControlMessageEvent;
 using openvpn::ClientAPI::Config;
@@ -30,16 +26,6 @@ namespace {
 char *dup_string(const std::string &value)
 {
     return ::strdup(value.c_str());
-}
-
-bool env_flag_enabled(const char *name)
-{
-    const char *value = std::getenv(name);
-    if (!value)
-        return false;
-
-    const std::string parsed(value);
-    return parsed == "1" || parsed == "true" || parsed == "TRUE" || parsed == "yes" || parsed == "YES";
 }
 
 class BridgeClient final : public OpenVPNClient
@@ -72,7 +58,6 @@ class BridgeClient final : public OpenVPNClient
         }
 
         last_info_ = ConnectionInfo{};
-        last_status_.clear();
 
         config_ = Config{};
         config_.content = config_content;
@@ -81,9 +66,16 @@ class BridgeClient final : public OpenVPNClient
         config_.info = true;
         config_.echo = true;
         config_.dco = false;
+        // Fail closed when the tunnel lacks one IP family instead of silently
+        // leaving native connectivity enabled outside the VPN.
+        config_.allowUnusedAddrFamilies = "no";
+        // Keep the utun device stable across reconnects and in-place mode switches.
         config_.tunPersist = true;
-        config_.enableLegacyAlgorithms = env_flag_enabled("CWRU_OVPN_ENABLE_LEGACY_ALGORITHMS");
-        config_.enableNonPreferredDCAlgorithms = env_flag_enabled("CWRU_OVPN_ENABLE_NON_PREFERRED_DC_ALGORITHMS");
+        // Force IPv4 transport: split-tunnel disables physical IPv6 to prevent leaks,
+        // which kills any IPv6 OpenVPN session and triggers a tear-down/reconnect cycle.
+        config_.protoVersionOverride = 4;
+        config_.enableLegacyAlgorithms = CWRU_OVPN_ENABLE_LEGACY_ALGORITHMS == 1;
+        config_.enableNonPreferredDCAlgorithms = CWRU_OVPN_ENABLE_NON_PREFERRED_DC_ALGORITHMS == 1;
 
         const EvalConfig eval = eval_config(config_);
         if (eval.error)
@@ -93,11 +85,10 @@ class BridgeClient final : public OpenVPNClient
         }
         if (!eval.autologin)
         {
-            error_message = "cwru-ovpn only supports autologin certificate profiles";
+            error_message = "Only autologin certificate profiles are supported.";
             return false;
         }
 
-        running_.store(true);
         worker_ = std::thread([this] { connect_thread(); });
         return true;
     }
@@ -107,12 +98,6 @@ class BridgeClient final : public OpenVPNClient
         OpenVPNClient::stop();
         if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id())
             worker_.join();
-        running_.store(false);
-    }
-
-    bool is_running() const
-    {
-        return running_.load();
     }
 
     char *copy_tun_name() const
@@ -168,13 +153,13 @@ class BridgeClient final : public OpenVPNClient
     void external_pki_cert_request(ExternalPKICertRequest &request) override
     {
         request.error = true;
-        request.errorText = "External PKI profiles are not supported by cwru-ovpn";
+        request.errorText = "External PKI profiles are not supported.";
     }
 
     void external_pki_sign_request(ExternalPKISignRequest &request) override
     {
         request.error = true;
-        request.errorText = "External PKI signing is not supported by cwru-ovpn";
+        request.errorText = "External PKI signing is not supported.";
     }
 
   private:
@@ -182,14 +167,7 @@ class BridgeClient final : public OpenVPNClient
     {
         const Status status = connect();
         if (status.error)
-        {
-            {
-                std::scoped_lock lock(mutex_);
-                last_status_ = status.message;
-            }
             emit("CORE_STATUS", status.message, true, true);
-        }
-        running_.store(false);
     }
 
     void emit(const std::string &name,
@@ -213,10 +191,8 @@ class BridgeClient final : public OpenVPNClient
     cwru_ovpn_event_callback_t callback_ = nullptr;
     void *callback_context_ = nullptr;
     std::thread worker_;
-    std::atomic<bool> running_{false};
     Config config_;
     ConnectionInfo last_info_;
-    std::string last_status_;
 };
 
 } // namespace
@@ -272,11 +248,6 @@ void cwru_ovpn_client_stop(cwru_ovpn_client_t *client)
 {
     if (client)
         client->impl.stop_and_join();
-}
-
-bool cwru_ovpn_client_is_running(const cwru_ovpn_client_t *client)
-{
-    return client ? client->impl.is_running() : false;
 }
 
 char *cwru_ovpn_client_copy_tun_name(const cwru_ovpn_client_t *client)

@@ -1,4 +1,64 @@
+import Darwin
 import Foundation
+
+func redactSensitiveText(_ value: String) -> String {
+    var sanitized = value
+
+    let fullLinePatterns: [(String, String)] = [
+        (#"(?m)^Session token:\s+.*$"#, "Session token: [redacted]"),
+        (#"(?m)^WEB_AUTH:[^\n]*$"#, "WEB_AUTH:[redacted]"),
+        (#"(?m)^OPEN_URL:[^\n]*$"#, "OPEN_URL:[redacted]")
+    ]
+
+    for (pattern, replacement) in fullLinePatterns {
+        sanitized = sanitized.replacingOccurrences(of: pattern,
+                                                   with: replacement,
+                                                   options: .regularExpression)
+    }
+
+    let inlinePatterns: [(String, String)] = [
+        (#"\[auth-token\]\s+[^\s\n]+"#, "[auth-token] [redacted]"),
+        (#"(?im)^Authorization:\s*Bearer\s+[^\s\n]+$"#, "Authorization: Bearer [redacted]"),
+        (#"(?i)\bbearer\s+[^\s\n]+"#, "Bearer [redacted]"),
+        (#"(?i)\b(auth[-_]?token|token|assertion|session)\s*[:=]\s*[^\s&]+"#, "$1=[redacted]")
+    ]
+
+    for (pattern, replacement) in inlinePatterns {
+        sanitized = sanitized.replacingOccurrences(of: pattern,
+                                                   with: replacement,
+                                                   options: .regularExpression)
+    }
+
+    return redactHTTPURLQueryStrings(in: sanitized)
+}
+
+private func redactHTTPURLQueryStrings(in value: String) -> String {
+    guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
+        return value
+    }
+
+    var redacted = value
+    let matches = detector.matches(in: redacted,
+                                   options: [],
+                                   range: NSRange(redacted.startIndex..., in: redacted)).reversed()
+    for match in matches {
+        guard let range = Range(match.range, in: redacted) else {
+            continue
+        }
+
+        let matchedURL = String(redacted[range])
+        guard (matchedURL.hasPrefix("https://") || matchedURL.hasPrefix("http://")),
+              let queryStart = matchedURL.firstIndex(of: "?") else {
+            continue
+        }
+
+        let fragment = matchedURL[queryStart...].firstIndex(of: "#").map { String(matchedURL[$0...]) } ?? ""
+        let replacement = String(matchedURL[..<queryStart]) + "?[redacted]" + fragment
+        redacted.replaceSubrange(range, with: replacement)
+    }
+
+    return redacted
+}
 
 private struct EventLogSessionRecord: Encodable {
     let kind = "session_start"
@@ -44,8 +104,8 @@ enum EventLog {
             if FileManager.default.fileExists(atPath: RuntimePaths.eventLogFile.path) {
                 try FileManager.default.removeItem(at: RuntimePaths.eventLogFile)
             }
-            FileManager.default.createFile(atPath: RuntimePaths.eventLogFile.path, contents: nil)
-            try RuntimePaths.secureFile(at: RuntimePaths.eventLogFile)
+            let handle = try openEventLogForAppend()
+            try? handle.close()
         } catch {
             fputs("\(AppIdentity.executableName): failed to reset event log: \(error.localizedDescription)\n", stderr)
         }
@@ -84,52 +144,62 @@ enum EventLog {
             var line = data
             line.append(0x0a)
 
-            if !FileManager.default.fileExists(atPath: RuntimePaths.eventLogFile.path) {
-                FileManager.default.createFile(atPath: RuntimePaths.eventLogFile.path, contents: nil)
-                try RuntimePaths.secureFile(at: RuntimePaths.eventLogFile)
-            }
-
-            let handle = try FileHandle(forWritingTo: RuntimePaths.eventLogFile)
-            defer { handle.closeFile() }
-            handle.seekToEndOfFile()
+            let handle = try openEventLogForAppend()
+            defer { try? handle.close() }
             handle.write(line)
-            try RuntimePaths.secureFile(at: RuntimePaths.eventLogFile)
         } catch {
             fputs("\(AppIdentity.executableName): failed to append event log: \(error.localizedDescription)\n", stderr)
         }
     }
 
-    private static func sanitize(_ value: String) -> String {
-        var sanitized = value
-
-        let fullLinePatterns: [(String, String)] = [
-            (#"(?m)^Session token:\s+.*$"#, "Session token: [redacted]"),
-            (#"(?m)^WEB_AUTH:[^\n]*$"#, "WEB_AUTH:[redacted]"),
-            (#"(?m)^OPEN_URL:[^\n]*$"#, "OPEN_URL:[redacted]")
-        ]
-
-        for (pattern, replacement) in fullLinePatterns {
-            sanitized = sanitized.replacingOccurrences(of: pattern,
-                                                       with: replacement,
-                                                       options: .regularExpression)
+    private static func openEventLogForAppend() throws -> FileHandle {
+        let path = RuntimePaths.eventLogFile.path
+        let fd = open(path,
+                      O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_CREAT,
+                      mode_t(S_IRUSR | S_IWUSR))
+        let openError = errno
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: openError) ?? .EIO)
         }
 
-        let inlinePatterns: [(String, String)] = [
-            (#"\[auth-token\]\s+[^\s\n]+"#, "[auth-token] [redacted]"),
-            (#"https?://cwru\.openvpn\.com/connect[^\s\n]*"#, "https://cwru.openvpn.com/connect?[redacted]")
-        ]
-
-        for (pattern, replacement) in inlinePatterns {
-            sanitized = sanitized.replacingOccurrences(of: pattern,
-                                                       with: replacement,
-                                                       options: .regularExpression)
+        var fileInfo = stat()
+        let statResult = fstat(fd, &fileInfo)
+        let statError = errno
+        guard statResult == 0 else {
+            close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: statError) ?? .EIO)
         }
 
-        return sanitized
+        guard (fileInfo.st_mode & S_IFMT) == S_IFREG else {
+            close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain,
+                          code: Int(EFTYPE),
+                          userInfo: [NSLocalizedDescriptionKey: "Refusing to append to a non-regular event log file."])
+        }
+
+        guard fchmod(fd, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+            let chmodError = errno
+            close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: chmodError) ?? .EIO)
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        if getuid() == 0,
+           let sudoUID = environment["SUDO_UID"].flatMap(UInt32.init),
+           let sudoGID = environment["SUDO_GID"].flatMap(UInt32.init),
+           fchown(fd, sudoUID, sudoGID) != 0 {
+            let chownError = errno
+            close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: chownError) ?? .EIO)
+        }
+
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
-    // ISO8601DateFormatter is documented as thread-safe on macOS 10.9+, so a
-    // shared instance avoids rebuilding the formatter on every log entry.
+    private static func sanitize(_ value: String) -> String {
+        redactSensitiveText(value)
+    }
+
     nonisolated(unsafe) private static let timestampFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

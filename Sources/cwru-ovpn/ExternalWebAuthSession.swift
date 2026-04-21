@@ -23,8 +23,6 @@ private final class ExternalWebAuthCompletionRelay: @unchecked Sendable {
     }
 }
 
-// ExternalWebAuthSession is isolated to @MainActor, so all state mutations
-// happen on the main actor. No additional locking is needed.
 @MainActor
 final class ExternalWebAuthSession: NSObject {
     private let url: URL
@@ -32,6 +30,8 @@ final class ExternalWebAuthSession: NSObject {
     private var session: ASWebAuthenticationSession?
     private var anchorWindow: NSWindow?
     private var expectedCancellation = false
+
+    var onUserCancelled: (() -> Void)?
 
     init(url: URL) {
         self.url = url
@@ -81,10 +81,17 @@ final class ExternalWebAuthSession: NSObject {
 
         teardownAnchorWindow()
 
-        guard !wasExpectedCancellation,
-              let error,
-              let authError = error as? ASWebAuthenticationSessionError,
-              authError.code != .canceledLogin else {
+        guard !wasExpectedCancellation else {
+            return
+        }
+
+        if let authError = error as? ASWebAuthenticationSessionError,
+           authError.code == .canceledLogin {
+            onUserCancelled?()
+            return
+        }
+
+        guard let error else {
             return
         }
 

@@ -2,6 +2,10 @@ import AppKit
 import Darwin
 import Foundation
 
+func renderUserFacingError(_ error: Error) -> String {
+    "\(error.localizedDescription)\n"
+}
+
 @MainActor
 private enum RuntimeState {
     static var controller: VPNController?
@@ -31,9 +35,10 @@ private enum DetachedConnectLauncher {
             return
         }
 
-        let executablePath = URL(fileURLWithPath: CommandLine.arguments[0]).standardized.path
-        let startupStatusFile = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("cwru-ovpn-startup-\(UUID().uuidString).json")
+        let executablePath = URL(fileURLWithPath: CommandLine.arguments[0])
+            .resolvingSymlinksInPath()
+            .standardized.path
+        let startupStatusFile = try RuntimePaths.createTemporaryFile(prefix: "startup-status")
         defer { try? FileManager.default.removeItem(at: startupStatusFile) }
 
         print("Starting VPN in \(tunnelMode.modeDescription) mode.")
@@ -55,7 +60,11 @@ private enum DetachedConnectLauncher {
         process.standardError = FileHandle(forWritingAtPath: "/dev/null")
 
         try process.run()
-        try waitForConnection(childPID: Int32(process.processIdentifier),
+        let childPID = Int32(process.processIdentifier)
+        let childStartTime = processStartTime(childPID)
+        try waitForConnection(childPID: childPID,
+                              expectedExecutablePath: executablePath,
+                              expectedStartTime: childStartTime,
                               startupStatusFilePath: startupStatusFile.path)
     }
 
@@ -82,8 +91,16 @@ private enum DetachedConnectLauncher {
     }
 
     private static func waitForConnection(childPID: Int32,
+                                          expectedExecutablePath: String,
+                                          expectedStartTime: ProcessStartTime?,
                                           startupStatusFilePath: String) throws {
         var announcedAuth = false
+        try RuntimePaths.ensureSessionStateDirectory()
+        let watchedDirectories = [
+            RuntimePaths.sessionStateDirectory,
+            URL(fileURLWithPath: startupStatusFilePath).standardizedFileURL.deletingLastPathComponent(),
+        ]
+        let monitor = BlockingEventMonitor(directoryURLs: watchedDirectories, processIDs: [childPID])
 
         while true {
             if let session = SessionState.load(), session.pid == childPID {
@@ -113,7 +130,12 @@ private enum DetachedConnectLauncher {
                 throw DetachedConnectError.launcherFailed(startupStatus.message)
             }
 
-            if kill(childPID, 0) != 0 && errno == ESRCH {
+            let childStillRunning =
+                processMatchesExecutable(childPID,
+                                         expectedExecutablePath: expectedExecutablePath,
+                                         expectedStartTime: expectedStartTime)
+                || (expectedStartTime == nil && processExists(childPID))
+            if !childStillRunning {
                 if let session = SessionState.load(), session.pid == childPID, session.phase == .connected {
                     print("Connected.")
                     return
@@ -124,7 +146,7 @@ private enum DetachedConnectLauncher {
                 )
             }
 
-            Thread.sleep(forTimeInterval: 0.2)
+            _ = monitor.wait(until: .distantFuture)
         }
     }
 }
@@ -159,11 +181,10 @@ enum CWRUOVPNMain {
                         break
                     }
                     let configuration = try AppConfig.load(explicitConfigPath: configFilePath)
-                    let profilePath = try configuration.resolvedProfilePath()
+                    let profilePath = try configuration.resolvedProfilePath(explicitConfigPath: configFilePath)
                     let effectiveAllowSleep = allowSleep || configuration.allowSleep
                     _ = NSApplication.shared
                     NSApplication.shared.setActivationPolicy(.accessory)
-                    AppMenu.installIfNeeded()
                     let resolvedConfigFilePath = AppConfig.resolvedConfigURL(explicitConfigPath: configFilePath)?.path
                     let controller = try VPNController(profilePath: profilePath,
                                                        configFilePath: resolvedConfigFilePath,
@@ -171,11 +192,16 @@ enum CWRUOVPNMain {
                                                        verbosity: verbosityOverride ?? configuration.verbosity,
                                                        tunnelMode: tunnelModeOverride ?? configuration.tunnelMode,
                                                        allowSleep: effectiveAllowSleep,
-                                                       backgroundChild: backgroundChild)
+                                                       backgroundChild: backgroundChild,
+                                                       startupStatusFilePath: startupStatusFilePath)
                     RuntimeState.controller = controller
                     try controller.start()
                     NSApplication.shared.run()
+                    let failureMessage = controller.terminalFailureMessage()
                     RuntimeState.controller = nil
+                    if let failureMessage {
+                        throw DetachedConnectError.launcherFailed(failureMessage)
+                    }
                 } catch {
                     if backgroundChild {
                         DetachedStartupStatus.writeFailure(message: error.localizedDescription,
@@ -211,7 +237,7 @@ enum CWRUOVPNMain {
                 CLI.printHelp()
             }
         } catch {
-            fputs("\(AppIdentity.executableName): \(error.localizedDescription)\n", stderr)
+            fputs(renderUserFacingError(error), stderr)
             exit(1)
         }
     }

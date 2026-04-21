@@ -1,7 +1,11 @@
 import Darwin
 import Foundation
 
-/// Returns true if the process with the given PID exists and is accessible.
+struct ProcessStartTime: Codable, Equatable {
+    let seconds: UInt64
+    let microseconds: UInt64
+}
+
 func processExists(_ pid: Int32) -> Bool {
     guard pid > 0 else {
         return false
@@ -12,7 +16,15 @@ func processExists(_ pid: Int32) -> Bool {
     return errno == EPERM
 }
 
-/// Returns the executable path for a process, or nil if it cannot be resolved.
+func processStartTime(_ pid: Int32) -> ProcessStartTime? {
+    guard let info = processBSDInfo(pid) else {
+        return nil
+    }
+
+    return ProcessStartTime(seconds: info.pbi_start_tvsec,
+                            microseconds: info.pbi_start_tvusec)
+}
+
 func processExecutablePath(_ pid: Int32) -> String? {
     guard pid > 0 else {
         return nil
@@ -49,8 +61,9 @@ func processExecutablePath(_ pid: Int32) -> String? {
     return output.hasPrefix("/") ? output : nil
 }
 
-/// Returns true when a process PID resolves to the expected executable path.
-func processMatchesExecutable(_ pid: Int32, expectedExecutablePath: String) -> Bool {
+func processMatchesExecutable(_ pid: Int32,
+                              expectedExecutablePath: String,
+                              expectedStartTime: ProcessStartTime? = nil) -> Bool {
     guard let actualPath = processExecutablePath(pid) else {
         return false
     }
@@ -67,5 +80,36 @@ func processMatchesExecutable(_ pid: Int32, expectedExecutablePath: String) -> B
         .resolvingSymlinksInPath()
         .standardized.path
 
-    return normalizedActual == normalizedExpected
+    guard normalizedActual == normalizedExpected else {
+        return false
+    }
+
+    if let expectedStartTime {
+        return processStartTime(pid) == expectedStartTime
+    }
+
+    return true
+}
+
+private func processBSDInfo(_ pid: Int32) -> proc_bsdinfo? {
+    guard pid > 0 else {
+        return nil
+    }
+
+    var info = proc_bsdinfo()
+    let infoSize = Int32(MemoryLayout<proc_bsdinfo>.stride)
+    let size = withUnsafeMutablePointer(to: &info) { pointer in
+        proc_pidinfo(pid,
+                     PROC_PIDTBSDINFO,
+                     UInt64(0),
+                     pointer,
+                     infoSize)
+    }
+
+    guard size == infoSize,
+          info.pbi_pid == UInt32(pid) else {
+        return nil
+    }
+
+    return info
 }

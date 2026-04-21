@@ -2,8 +2,6 @@ import Foundation
 
 enum CleanupWatchdog {
     static func run(parentPID: Int32) {
-        // Use a kernel-level process-exit event instead of a polling loop so the
-        // watchdog consumes no CPU while the parent is running.
         let source = DispatchSource.makeProcessSource(
             identifier: pid_t(parentPID),
             eventMask: .exit,
@@ -18,8 +16,6 @@ enum CleanupWatchdog {
 
         source.resume()
 
-        // Handle the race where the parent exited (or the session was already
-        // cleaned up) before the DispatchSource was armed.
         DispatchQueue.main.async {
             if !processExists(parentPID) || SessionState.load() == nil {
                 source.cancel()
@@ -31,7 +27,7 @@ enum CleanupWatchdog {
         dispatchMain()
     }
 
-    private static func performCleanup(parentPID: Int32) {
+    static func performCleanup(parentPID: Int32) {
         guard let session = SessionState.load() else {
             return
         }
@@ -43,9 +39,9 @@ enum CleanupWatchdog {
         }
 
         do {
-            let configuration = try AppConfig.load(explicitConfigPath: session.configFilePath)
             if session.cleanupNeeded {
-                let cleanupHealthy = try RouteManager(configuration: configuration.splitTunnel).cleanup(using: session)
+                try VPNController.validateSessionForPrivilegedCleanup(session)
+                let cleanupHealthy = try VPNController.cleanupRouteManager(for: session).cleanup(using: session)
                 if !cleanupHealthy {
                     var recoveryState = session
                     recoveryState.markRecoveryRequired(message: "Cleanup watchdog ran, but the network still looks unhealthy.")

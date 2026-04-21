@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum SetupError: LocalizedError {
@@ -19,17 +20,13 @@ enum SetupError: LocalizedError {
 
 enum Setup {
     static func installSudoers(profileSourcePath: String?) throws {
-        let executablePath = URL(fileURLWithPath: CommandLine.arguments[0])
+        let sourceExecutablePath = URL(fileURLWithPath: CommandLine.arguments[0])
             .resolvingSymlinksInPath()
             .standardized.path
         let environment = ProcessInfo.processInfo.environment
         let username = environment["SUDO_USER"].flatMap { $0.isEmpty ? nil : $0 } ?? NSUserName()
 
         try assertSafeForSudoersUser(username)
-
-        // Sudoers does not support quoted paths or standard shell escaping.
-        // Reject paths with characters that would break the rule syntax.
-        try assertSafeForSudoers(path: executablePath, label: "Executable path")
 
         try ensureHomeStateDirectory()
         if let profileSourcePath {
@@ -39,11 +36,16 @@ enum Setup {
             print("No VPN profile was copied. Place one at \(RuntimePaths.homeProfileFile.path) or rerun setup --profile /path/to/profile.ovpn.")
         }
 
-        let sudoersBody = renderSudoers(username: username,
-                                        executablePath: executablePath)
+        let installedExecutablePath = try installPrivilegedExecutable(from: sourceExecutablePath)
 
-        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("cwru-ovpn.sudoers.\(UUID().uuidString)")
+        try assertSafeForSudoers(path: installedExecutablePath, label: "Executable path")
+        let installedExecutableDigest = try executableSHA256(at: installedExecutablePath)
+
+        let sudoersBody = renderSudoers(username: username,
+                                        executablePath: installedExecutablePath,
+                                        executableDigest: installedExecutableDigest)
+
+        let tempURL = try RuntimePaths.createTemporaryFile(prefix: "sudoers")
         try sudoersBody.appending("\n").write(to: tempURL, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: tempURL) }
 
@@ -63,8 +65,9 @@ enum Setup {
                           requirePrivileges: true)
 
         print("Installed the sudoers rule at /etc/sudoers.d/cwru-ovpn.")
-        print("Passwordless commands now cover the standard cwru-ovpn connect invocations, plus disconnect, status, and plain setup.")
-        print("cwru-ovpn connect supports the existing approved options: --mode full|split, --verbosity debug, --foreground, and --allow-sleep.")
+        print("Installed the privileged binary at \(installedExecutablePath).")
+        print("Passwordless commands now cover connect, connect --mode full|split, those same forms with --verbosity debug, the debug foreground variants, and each of those with trailing --allow-sleep, pinned to the installed binary's SHA-256 digest.")
+        print("Disconnect (plain, -f, or --force) and plain setup are also covered.")
     }
 
     static func uninstall(purge: Bool) throws {
@@ -76,13 +79,27 @@ enum Setup {
             print("No sudoers rule found at \(sudoersPath) — nothing to remove.")
         }
 
-        if let config = try? AppConfig.load(explicitConfigPath: nil) {
-            for domain in config.splitTunnel.effectiveResolverDomains {
-                let resolverPath = ResolverPaths.fileURL(for: domain).path
-                if FileManager.default.fileExists(atPath: resolverPath) {
-                    _ = try Shell.run("/bin/rm", arguments: ["-f", resolverPath], allowNonZero: true, requirePrivileges: true)
-                    print("Removed resolver file at \(resolverPath).")
-                }
+        let privilegedExecutablePath = RuntimePaths.privilegedExecutable.path
+        if FileManager.default.fileExists(atPath: privilegedExecutablePath) {
+            _ = try Shell.run("/bin/rm", arguments: ["-f", privilegedExecutablePath], requirePrivileges: true)
+            print("Removed privileged binary at \(privilegedExecutablePath).")
+        }
+
+        let privilegedDirectoryPath = RuntimePaths.privilegedExecutableDirectory.path
+        if FileManager.default.fileExists(atPath: privilegedDirectoryPath),
+           let contents = try? FileManager.default.contentsOfDirectory(atPath: privilegedDirectoryPath),
+           contents.isEmpty {
+            _ = try Shell.run("/bin/rmdir",
+                              arguments: [privilegedDirectoryPath],
+                              allowNonZero: true,
+                              requirePrivileges: true)
+        }
+
+        for domain in resolverDomainsForUninstall() {
+            let resolverPath = ResolverPaths.fileURL(for: domain).path
+            if FileManager.default.fileExists(atPath: resolverPath) {
+                _ = try Shell.run("/bin/rm", arguments: ["-f", resolverPath], allowNonZero: true, requirePrivileges: true)
+                print("Removed resolver file at \(resolverPath).")
             }
         }
 
@@ -104,17 +121,22 @@ enum Setup {
                 print("Removed state directory at \(stateDirectory).")
             }
         } else {
-            print("Left \(RuntimePaths.homeStateDirectory.path) in place. Re-run uninstall --purge to remove profiles, configs, binaries, and logs.")
+            print("Left \(RuntimePaths.homeStateDirectory.path) in place. Re-run uninstall --purge to remove profiles, configs, and logs.")
         }
     }
 
-    // MARK: - Helpers
-
     static func renderSudoers(username: String,
-                              executablePath: String) -> String {
+                              executablePath: String,
+                              executableDigest: String) -> String {
         permittedInvocations(executablePath: executablePath)
-            .map { "\(username) ALL=(root) NOPASSWD: \($0.joined(separator: " "))" }
+            .map { "\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \($0.joined(separator: " "))" }
             .joined(separator: "\n")
+    }
+
+    static func executableSHA256(at path: String) throws -> String {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     static func validateSudoersFile(at path: String) throws -> ShellResult {
@@ -129,7 +151,6 @@ enum Setup {
             [executablePath, "disconnect"],
             [executablePath, "disconnect", "-f"],
             [executablePath, "disconnect", "--force"],
-            [executablePath, "status"],
             [executablePath, "setup"],
         ]
         return connectCommands + fixedCommands
@@ -169,6 +190,27 @@ enum Setup {
         try RuntimePaths.secureDirectory(at: RuntimePaths.homeStateDirectory)
     }
 
+    private static func installPrivilegedExecutable(from sourcePath: String) throws -> String {
+        let installDirectory = RuntimePaths.privilegedExecutableDirectory.path
+        let installPath = RuntimePaths.privilegedExecutable.path
+
+        _ = try Shell.run("/bin/mkdir",
+                          arguments: ["-p", installDirectory],
+                          requirePrivileges: true)
+        _ = try Shell.run("/usr/sbin/chown",
+                          arguments: ["root:wheel", installDirectory],
+                          requirePrivileges: true)
+        _ = try Shell.run("/bin/chmod",
+                          arguments: ["755", installDirectory],
+                          requirePrivileges: true)
+        _ = try Shell.run("/usr/bin/install",
+                          arguments: ["-o", "root", "-g", "wheel", "-m", "555", sourcePath, installPath],
+                          requirePrivileges: true)
+
+        try assertSecureExecutableHierarchy(at: installPath)
+        return installPath
+    }
+
     @discardableResult
     private static func installProfile(from sourcePath: String) throws -> URL {
         let sourceURL = URL(fileURLWithPath: AppConfig.expandUserPath(sourcePath)).standardized
@@ -185,6 +227,24 @@ enum Setup {
         return destinationURL
     }
 
+    private static func resolverDomainsForUninstall() -> [String] {
+        var domains = Set<String>()
+
+        if let config = try? AppConfig.load(explicitConfigPath: nil) {
+            for domain in config.splitTunnel.effectiveResolverDomains where AppConfig.SplitTunnelConfiguration.isValidDomainName(domain) && ResolverPaths.isSafeDomainFileName(domain) {
+                domains.insert(domain)
+            }
+        }
+
+        if let session = SessionState.load() {
+            for domain in session.appliedResolverDomains ?? [] where AppConfig.SplitTunnelConfiguration.isValidDomainName(domain) && ResolverPaths.isSafeDomainFileName(domain) {
+                domains.insert(domain)
+            }
+        }
+
+        return domains.sorted()
+    }
+
     private static let sudoersPathAllowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+")
     private static let sudoersUserAllowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
@@ -198,9 +258,6 @@ enum Setup {
         }
     }
 
-    /// Asserts that a path is safe for literal inclusion in a sudoers rule.
-    /// Sudoers has no quoting mechanism for paths; spaces, backslashes, and
-    /// comment characters would silently corrupt the rule.
     private static func assertSafeForSudoers(path: String, label: String) throws {
         guard !path.isEmpty, path.hasPrefix("/") else {
             throw SetupError.unsafePath("\(label) must be an absolute path: \(path)")
@@ -214,6 +271,35 @@ enum Setup {
 
         if path.contains("..") {
             throw SetupError.unsafePath("\(label) must not contain '..' path segments: \(path)")
+        }
+    }
+
+    private static func assertSecureExecutableHierarchy(at path: String) throws {
+        let resolvedPath = URL(fileURLWithPath: path)
+            .resolvingSymlinksInPath()
+            .standardized.path
+        var currentURL = URL(fileURLWithPath: resolvedPath)
+
+        while true {
+            try assertRootOwnedAndNonWritableByNonRoot(currentURL.path)
+            let parentURL = currentURL.deletingLastPathComponent()
+            if parentURL.path == currentURL.path {
+                break
+            }
+            currentURL = parentURL
+        }
+    }
+
+    private static func assertRootOwnedAndNonWritableByNonRoot(_ path: String) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        guard let owner = attributes[.ownerAccountID] as? NSNumber,
+              owner.intValue == 0 else {
+            throw SetupError.unsafePath("Refusing to trust non-root-owned install path component: \(path)")
+        }
+
+        guard let permissions = attributes[.posixPermissions] as? NSNumber,
+              permissions.intValue & 0o022 == 0 else {
+            throw SetupError.unsafePath("Refusing to trust writable install path component: \(path)")
         }
     }
 }

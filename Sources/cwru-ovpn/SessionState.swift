@@ -12,6 +12,7 @@ struct SessionState: Codable {
 
     var pid: Int32
     var executablePath: String?
+    var processStartTime: ProcessStartTime?
     var phase: Phase
     var profilePath: String
     var configFilePath: String?
@@ -63,6 +64,7 @@ struct SessionState: Codable {
         let data = try encoder.encode(self)
         try data.write(to: RuntimePaths.sessionStateFile, options: .atomic)
         try RuntimePaths.secureSessionStateFile(at: RuntimePaths.sessionStateFile)
+        try saveHomeMirrorIfNeeded(data)
     }
 
     mutating func markRecoveryRequired(message: String) {
@@ -74,8 +76,8 @@ struct SessionState: Codable {
 
     static func remove() {
         try? FileManager.default.removeItem(at: RuntimePaths.sessionStateFile)
-        if RuntimePaths.legacySessionStateFile.path != RuntimePaths.sessionStateFile.path {
-            try? FileManager.default.removeItem(at: RuntimePaths.legacySessionStateFile)
+        if RuntimePaths.homeSessionStateFile.path != RuntimePaths.sessionStateFile.path {
+            try? FileManager.default.removeItem(at: RuntimePaths.homeSessionStateFile)
         }
     }
 
@@ -85,12 +87,25 @@ struct SessionState: Codable {
         }
 
         let primary = RuntimePaths.sessionStateFile
-        guard primary.path != RuntimePaths.legacySessionStateFile.path,
-              isSecureRootOwnedFile(RuntimePaths.legacySessionStateFile) else {
+        guard primary.path != RuntimePaths.homeSessionStateFile.path,
+              isSecureRootOwnedFile(RuntimePaths.homeSessionStateFile) else {
             return [primary]
         }
 
-        return [primary, RuntimePaths.legacySessionStateFile]
+        return [primary, RuntimePaths.homeSessionStateFile]
+    }
+
+    private func saveHomeMirrorIfNeeded(_ data: Data) throws {
+        let homeMirror = RuntimePaths.homeSessionStateFile
+        guard homeMirror.path != RuntimePaths.sessionStateFile.path else {
+            return
+        }
+
+        try FileManager.default.createDirectory(at: RuntimePaths.homeStateDirectory,
+                                                withIntermediateDirectories: true)
+        try RuntimePaths.secureDirectory(at: RuntimePaths.homeStateDirectory)
+        try data.write(to: homeMirror, options: .atomic)
+        try RuntimePaths.secureFile(at: homeMirror)
     }
 
     private static func isSecureRootOwnedFile(_ fileURL: URL) -> Bool {

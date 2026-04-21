@@ -1,5 +1,5 @@
 import Foundation
-import Darwin
+import Network
 
 struct ReachabilityProbeResult {
     let checkedHosts: [String]
@@ -11,10 +11,16 @@ struct ReachabilityProbeResult {
 }
 
 enum ReachabilityProbe {
+    private static let queue = DispatchQueue(label: "cwru-ovpn.reachability-probe.connection", qos: .utility)
+
     static func run(hosts: [String], timeout: TimeInterval = 2.0) -> ReachabilityProbeResult {
+        var seen = Set<String>()
         let normalizedHosts = hosts.compactMap { host -> String? in
             let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else {
+                return nil
+            }
+            return trimmed
         }
 
         guard !normalizedHosts.isEmpty else {
@@ -22,7 +28,7 @@ enum ReachabilityProbe {
         }
 
         for host in normalizedHosts {
-            if ping(host: host, timeout: timeout) {
+            if isReachable(host: host, timeout: timeout) {
                 return ReachabilityProbeResult(checkedHosts: normalizedHosts, reachableHost: host)
             }
         }
@@ -30,36 +36,43 @@ enum ReachabilityProbe {
         return ReachabilityProbeResult(checkedHosts: normalizedHosts, reachableHost: nil)
     }
 
-    private static func ping(host: String, timeout: TimeInterval) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/sbin/ping")
-        process.arguments = ["-c", "1", host]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-
-        let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            finished.signal()
-        }
-
-        do {
-            try process.run()
-        } catch {
+    private static func isReachable(host: String, timeout: TimeInterval) -> Bool {
+        guard let port = NWEndpoint.Port(rawValue: 443) else {
             return false
         }
 
-        if finished.wait(timeout: .now() + timeout) == .success {
-            return process.terminationStatus == 0
-        }
-
-        if process.isRunning {
-            process.terminate()
-            if finished.wait(timeout: .now() + 1) == .timedOut, process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-                _ = finished.wait(timeout: .now() + 1)
+        let stateBox = ReachabilityStateBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        let connection = NWConnection(host: NWEndpoint.Host(host),
+                                      port: port,
+                                      using: .udp)
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                stateBox.isReachable = true
+                semaphore.signal()
+            case .failed(_), .cancelled:
+                semaphore.signal()
+            case .waiting(_):
+                semaphore.signal()
+            default:
+                break
             }
         }
 
-        return false
+        connection.start(queue: queue)
+        defer {
+            connection.cancel()
+        }
+
+        guard semaphore.wait(timeout: .now() + timeout) == .success else {
+            return false
+        }
+
+        return stateBox.isReachable
     }
+}
+
+private final class ReachabilityStateBox: @unchecked Sendable {
+    var isReachable = false
 }

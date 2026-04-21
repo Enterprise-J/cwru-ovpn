@@ -29,7 +29,6 @@ bool cwru_ovpn_client_start(cwru_ovpn_client_t *client,
                            char **error_message);
 
 void cwru_ovpn_client_stop(cwru_ovpn_client_t *client);
-bool cwru_ovpn_client_is_running(const cwru_ovpn_client_t *client);
 
 char *cwru_ovpn_client_copy_tun_name(const cwru_ovpn_client_t *client);
 char *cwru_ovpn_client_copy_vpn_ipv4(const cwru_ovpn_client_t *client);

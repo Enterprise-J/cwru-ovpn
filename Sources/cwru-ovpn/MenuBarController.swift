@@ -4,6 +4,7 @@ import Foundation
 struct MenuBarSnapshot {
     let phase: SessionState.Phase
     let tunnelMode: AppTunnelMode
+    let requestedTunnelMode: AppTunnelMode?
     let statusText: String
     let detailText: String
 }
@@ -16,8 +17,10 @@ final class MenuBarController: NSObject {
     private let statusItemRow = NSMenuItem(title: "Status: Connecting", action: nil, keyEquivalent: "")
     private let modeItem = NSMenuItem(title: "Mode: Split Tunnel", action: nil, keyEquivalent: "")
     private let detailItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let switchModeItem = NSMenuItem(title: "Switch to Full Tunnel", action: nil, keyEquivalent: "")
     private let disconnectItem = NSMenuItem(title: "Disconnect", action: nil, keyEquivalent: "")
 
+    var onSwitchMode: (() -> Void)?
     var onDisconnect: (() -> Void)?
 
     override init() {
@@ -34,6 +37,10 @@ final class MenuBarController: NSObject {
         modeItem.isEnabled = false
         detailItem.isEnabled = false
         detailItem.isHidden = true
+        switchModeItem.isHidden = true
+
+        switchModeItem.target = self
+        switchModeItem.action = #selector(handleSwitchMode)
 
         disconnectItem.target = self
         disconnectItem.action = #selector(handleDisconnect)
@@ -44,6 +51,7 @@ final class MenuBarController: NSObject {
         menu.addItem(modeItem)
         menu.addItem(detailItem)
         menu.addItem(.separator())
+        menu.addItem(switchModeItem)
         menu.addItem(disconnectItem)
 
         statusItem.menu = menu
@@ -51,10 +59,25 @@ final class MenuBarController: NSObject {
 
     func update(with snapshot: MenuBarSnapshot) {
         let indicator = VPNController.statusIndicator(for: snapshot.phase, tunnelMode: snapshot.tunnelMode)
+        let targetMode = snapshot.tunnelMode == .split ? AppTunnelMode.full : .split
         statusItemRow.title = "Status: \(snapshot.statusText)"
         modeItem.title = "Mode: \(snapshot.tunnelMode.displayName)"
         detailItem.title = snapshot.detailText
         detailItem.isHidden = snapshot.detailText.isEmpty
+
+        if snapshot.phase == .connected {
+            switchModeItem.isHidden = false
+            if let requestedTunnelMode = snapshot.requestedTunnelMode {
+                switchModeItem.title = "Switching to \(requestedTunnelMode.displayName)..."
+                switchModeItem.isEnabled = false
+            } else {
+                switchModeItem.title = "Switch to \(targetMode.displayName)"
+                switchModeItem.isEnabled = true
+            }
+        } else {
+            switchModeItem.isHidden = true
+            switchModeItem.isEnabled = false
+        }
 
         disconnectItem.isEnabled = snapshot.phase != .disconnecting && snapshot.phase != .disconnected
 
@@ -66,6 +89,11 @@ final class MenuBarController: NSObject {
 
     func close() {
         NSStatusBar.system.removeStatusItem(statusItem)
+    }
+
+    @objc
+    private func handleSwitchMode() {
+        onSwitchMode?()
     }
 
     @objc

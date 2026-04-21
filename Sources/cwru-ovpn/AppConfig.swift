@@ -71,6 +71,16 @@ struct AppConfig: Codable {
         var resolverNameServers: [String]
         var reachabilityProbeHosts: [String]?
 
+        init(includedRoutes: [String],
+             resolverDomains: [String],
+             resolverNameServers: [String],
+             reachabilityProbeHosts: [String]?) {
+            self.includedRoutes = includedRoutes
+            self.resolverDomains = resolverDomains
+            self.resolverNameServers = resolverNameServers
+            self.reachabilityProbeHosts = reachabilityProbeHosts
+        }
+
         var effectiveReachabilityProbeHosts: [String] {
             guard let reachabilityProbeHosts else {
                 return Self.defaultReachabilityProbeHosts
@@ -82,10 +92,6 @@ struct AppConfig: Codable {
             }
         }
 
-        /// Resolver domains used at runtime: the user's `resolverDomains` plus
-        /// in-addr.arpa zones derived from `includedRoutes`. Auto-deriving the
-        /// reverse zones ensures PTR lookups for campus IPs cannot leak even if
-        /// the user edits resolverDomains.
         var effectiveResolverDomains: [String] {
             var seen = Set<String>()
             var result: [String] = []
@@ -114,8 +120,6 @@ struct AppConfig: Codable {
             return zones.sorted()
         }
 
-        /// Returns a human-readable error message if any values fail validation,
-        /// or nil when the configuration is valid.
         func validationError() -> String? {
             for route in includedRoutes {
                 if !Self.isValidCIDR(route) {
@@ -142,9 +146,6 @@ struct AppConfig: Codable {
             }
             return nil
         }
-
-        // MARK: - Validators
-
         static func isValidCIDR(_ value: String) -> Bool {
             let parts = value.split(separator: "/", maxSplits: 1)
             guard parts.count == 2,
@@ -179,6 +180,21 @@ struct AppConfig: Codable {
 
         static func isValidReachabilityProbeHost(_ value: String) -> Bool {
             isValidIPAddress(value) || isValidDomainName(value)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case includedRoutes
+            case resolverDomains
+            case resolverNameServers
+            case reachabilityProbeHosts
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            includedRoutes = try container.decodeIfPresent([String].self, forKey: .includedRoutes) ?? []
+            resolverDomains = try container.decodeIfPresent([String].self, forKey: .resolverDomains) ?? []
+            resolverNameServers = try container.decodeIfPresent([String].self, forKey: .resolverNameServers) ?? []
+            reachabilityProbeHosts = try container.decodeIfPresent([String].self, forKey: .reachabilityProbeHosts)
         }
     }
 
@@ -244,15 +260,19 @@ struct AppConfig: Codable {
         return nil
     }
 
-    func resolvedProfilePath() throws -> String {
+    func resolvedProfilePath(explicitConfigPath: String?) throws -> String {
         if let profilePath, !profilePath.isEmpty {
             return URL(fileURLWithPath: Self.expandUserPath(profilePath)).standardized.path
+        }
+        if Self.resolvedConfigURL(explicitConfigPath: explicitConfigPath) == nil {
+            throw CLIError.missingConfigFile
         }
         throw CLIError.missingConfig
     }
 
     static func expandUserPath(_ path: String) -> String {
-        if path == "~" || path.hasPrefix("~/") {
+        if getuid() == 0,
+           path == "~" || path.hasPrefix("~/") {
             let environment = ProcessInfo.processInfo.environment
             if let sudoUser = environment["SUDO_USER"],
                !sudoUser.isEmpty,
@@ -330,8 +350,6 @@ struct AppConfig: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let legacyContainer = try decoder.container(keyedBy: LegacyCodingKeys.self)
 
-        // Keep loading the legacy field names so older installs continue to
-        // work after the config schema was simplified.
         profilePath = try container.decodeIfPresent(String.self, forKey: .profilePath)
             ?? legacyContainer.decodeIfPresent(String.self, forKey: .defaultProfilePath)
         tunnelMode = try container.decodeIfPresent(AppTunnelMode.self, forKey: .tunnelMode) ?? Self.fallback.tunnelMode

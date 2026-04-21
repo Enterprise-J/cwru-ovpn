@@ -2,6 +2,7 @@ import AppKit
 import COpenVPN3Wrapper
 import Darwin
 import Foundation
+import Network
 
 enum VPNControllerError: LocalizedError {
     case failedToStart(String)
@@ -34,14 +35,6 @@ fileprivate final class VPNEventPayload: NSObject {
     }
 }
 
-fileprivate final class RouteMonitorPayload: NSObject {
-    let data: Data
-
-    init(data: Data) {
-        self.data = data
-    }
-}
-
 fileprivate final class ReachabilityProbePayload: NSObject {
     let checkedHosts: [String]
     let reachableHost: String?
@@ -54,27 +47,19 @@ fileprivate final class ReachabilityProbePayload: NSObject {
     }
 }
 
+fileprivate final class PathMonitorPayload: NSObject {
+    let reason: String
+
+    init(reason: String) {
+        self.reason = reason
+    }
+}
+
 private struct ManagedReconnectRequest {
     let configFilePath: String?
     let tunnelMode: AppTunnelMode
     let allowSleep: Bool
     let reason: String
-}
-
-private final class RouteMonitorRelay: @unchecked Sendable {
-    weak var owner: VPNController?
-
-    func deliver(_ data: Data) {
-        guard let owner else {
-            return
-        }
-
-        let payload = RouteMonitorPayload(data: data)
-        owner.perform(#selector(VPNController.handleRouteMonitorPayload(_:)),
-                      on: Thread.main,
-                      with: payload,
-                      waitUntilDone: false)
-    }
 }
 
 private final class ReachabilityProbeRelay: @unchecked Sendable {
@@ -89,6 +74,22 @@ private final class ReachabilityProbeRelay: @unchecked Sendable {
                                                reachableHost: result.reachableHost,
                                                reason: reason)
         owner.perform(#selector(VPNController.handleReachabilityProbePayload(_:)),
+                      on: Thread.main,
+                      with: payload,
+                      waitUntilDone: false)
+    }
+}
+
+private final class PathMonitorRelay: @unchecked Sendable {
+    weak var owner: VPNController?
+
+    func deliver(reason: String) {
+        guard let owner else {
+            return
+        }
+
+        let payload = PathMonitorPayload(reason: reason)
+        owner.perform(#selector(VPNController.handlePathMonitorPayload(_:)),
                       on: Thread.main,
                       with: payload,
                       waitUntilDone: false)
@@ -127,19 +128,17 @@ final class VPNController: NSObject {
     private var sessionState: SessionState
     private var client: OpaquePointer?
     private var signalSources: [DispatchSourceSignal] = []
-    private var routeMonitorTimer: DispatchSourceTimer?
-    private var routeMonitorProcess: Process?
-    private var routeMonitorOutputPipe: Pipe?
-    private var routeMonitorBuffer = Data()
-    private let routeMonitorRelay = RouteMonitorRelay()
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(label: "cwru-ovpn.network-path-monitor", qos: .utility)
+    private let pathMonitorRelay = PathMonitorRelay()
+    private var hasSeenInitialPathUpdate = false
     private let reachabilityProbeRelay = ReachabilityProbeRelay()
     private var routeHealthCheckScheduled = false
     private let reachabilityProbeQueue = DispatchQueue(label: "cwru-ovpn.reachability-probe", qos: .utility)
     private var reachabilityProbeInFlight = false
     private var lastReachabilityProbeHealthy = true
     private var lastReachabilityFailureAt: Date?
-    private var caffeinateProcess: Process?
-    private var webAuthWindowController: WebAuthWindowController?
+    private var sleepActivityToken: NSObjectProtocol?
     private var externalWebAuthSession: ExternalWebAuthSession?
     private var controllerLockFD: Int32 = -1
     private var cleanupComplete = false
@@ -150,6 +149,8 @@ final class VPNController: NSObject {
     private var disconnectingAfterWake = false
     private let allowSleep: Bool
     private let backgroundChild: Bool
+    private let startupStatusFilePath: String?
+    private var exitFailureMessage: String?
 
     init(profilePath: String,
          configFilePath: String?,
@@ -157,10 +158,16 @@ final class VPNController: NSObject {
          verbosity: AppVerbosity,
          tunnelMode: AppTunnelMode,
          allowSleep: Bool,
-         backgroundChild: Bool = false) throws {
+         backgroundChild: Bool = false,
+         startupStatusFilePath: String? = nil) throws {
         let routeManager = RouteManager(configuration: configuration.splitTunnel)
         let physicalNetwork = try routeManager.detectPhysicalNetwork()
         let physicalDNSConfiguration = try routeManager.capturePhysicalDNSConfiguration(for: physicalNetwork.interfaceName)
+        if tunnelMode == .split, physicalDNSConfiguration == nil {
+            throw VPNControllerError.failedToStart(
+                "Could not capture the active macOS DNS service for split-tunnel DNS isolation."
+            )
+        }
         self.profilePath = URL(fileURLWithPath: profilePath).standardized.path
         self.configFilePath = configFilePath.map { URL(fileURLWithPath: $0).standardized.path }
         self.ssoMethods = AppConfig.hardcodedSSOMethods.joined(separator: ",")
@@ -170,9 +177,11 @@ final class VPNController: NSObject {
         self.routeManager = routeManager
         self.allowSleep = allowSleep
         self.backgroundChild = backgroundChild
+        self.startupStatusFilePath = startupStatusFilePath.map { URL(fileURLWithPath: $0).standardized.path }
         self.sessionState = SessionState(
             pid: getpid(),
             executablePath: Self.currentExecutablePath,
+            processStartTime: processStartTime(getpid()),
             phase: .connecting,
             profilePath: self.profilePath,
             configFilePath: self.configFilePath,
@@ -202,7 +211,7 @@ final class VPNController: NSObject {
             cleanupNeeded: false
         )
         super.init()
-        self.routeMonitorRelay.owner = self
+        self.pathMonitorRelay.owner = self
         self.reachabilityProbeRelay.owner = self
     }
 
@@ -267,22 +276,25 @@ final class VPNController: NSObject {
         let expectedExecutablePath = session.executablePath ?? currentExecutablePath
 
         if processExists(session.pid) {
-            guard processMatchesExecutable(session.pid,
-                                          expectedExecutablePath: expectedExecutablePath) else {
-                throw VPNControllerError.unsafeSessionState(
-                    "Refusing to signal PID \(session.pid) because it does not match the expected \(AppIdentity.executableName) executable path."
-                )
+            guard try signalValidatedProcess(pid: session.pid,
+                                             expectedExecutablePath: expectedExecutablePath,
+                                             expectedStartTime: session.processStartTime,
+                                             signal: SIGTERM) else {
+                if session.cleanupNeeded {
+                    return try disconnectExistingSession(force: force)
+                }
+                SessionState.remove()
+                print("Removed stale state.")
+                return
             }
-            kill(session.pid, SIGTERM)
             print("Disconnect requested.")
             return
         }
 
         if session.cleanupNeeded {
             try validateSessionForPrivilegedCleanup(session)
-            let configuration = try AppConfig.load(explicitConfigPath: session.configFilePath)
             do {
-                let cleanupHealthy = try RouteManager(configuration: configuration.splitTunnel).cleanup(using: session)
+                let cleanupHealthy = try cleanupRouteManager(for: session).cleanup(using: session)
                 if !cleanupHealthy {
                     if force {
                         print("Cleanup ran but network looks unhealthy; forcing state removal anyway.")
@@ -328,12 +340,10 @@ final class VPNController: NSObject {
             return false
         }
 
-        guard processMatchesExecutable(session.pid,
-                                       expectedExecutablePath: expectedExecutablePath) else {
-            throw VPNControllerError.unsafeSessionState(
-                "Refusing to control PID \(session.pid) because it does not match the expected \(AppIdentity.executableName) executable path."
-            )
-        }
+        _ = try signalValidatedProcess(pid: session.pid,
+                                       expectedExecutablePath: expectedExecutablePath,
+                                       expectedStartTime: session.processStartTime,
+                                       signal: 0)
 
         if let configFilePath {
             let requestedConfigFilePath = URL(fileURLWithPath: AppConfig.expandUserPath(configFilePath)).standardized.path
@@ -355,16 +365,22 @@ final class VPNController: NSObject {
 
             session.requestedTunnelMode = targetMode
             try session.save()
-            kill(session.pid, SIGUSR1)
+            _ = try signalValidatedProcess(pid: session.pid,
+                                           expectedExecutablePath: expectedExecutablePath,
+                                           expectedStartTime: session.processStartTime,
+                                           signal: SIGUSR1)
             try waitForModeSwitch(pid: session.pid, targetMode: targetMode)
-            print("Switched to \(targetMode.modeDescription) mode without reconnecting.")
+            print("Switched to \(targetMode.modeDescription) mode.")
             return true
 
         case .connecting, .authPending:
             if session.requestedTunnelMode != targetMode {
                 session.requestedTunnelMode = targetMode
                 try session.save()
-                kill(session.pid, SIGUSR1)
+                _ = try signalValidatedProcess(pid: session.pid,
+                                               expectedExecutablePath: expectedExecutablePath,
+                                               expectedStartTime: session.processStartTime,
+                                               signal: SIGUSR1)
             }
             print("A VPN session is already connecting. Requested \(targetMode.modeDescription) mode; it will apply after connection.")
             return true
@@ -382,34 +398,85 @@ final class VPNController: NSObject {
     private static func waitForModeSwitch(pid: Int32,
                                           targetMode: AppTunnelMode,
                                           timeout: TimeInterval = 8.0) throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let monitor = BlockingEventMonitor(directoryURLs: [RuntimePaths.sessionStateDirectory], processIDs: [pid])
+        let deadline = DispatchTime.now() + timeout
+        var sawRequestedMode = false
+
+        while true {
             guard processExists(pid) else {
                 throw VPNControllerError.failedToStart(
                     "The active VPN session exited while applying the mode switch."
                 )
             }
 
-            if let session = SessionState.load(), session.pid == pid {
-                if session.phase == .failed {
-                    throw VPNControllerError.failedToStart(
-                        session.lastInfo ?? "Mode switch failed."
-                    )
-                }
-
-                if session.phase == .connected,
-                   session.tunnelMode == targetMode,
-                   session.requestedTunnelMode == nil {
-                    return
-                }
+            switch evaluateModeSwitchWaitState(session: SessionState.load(),
+                                               pid: pid,
+                                               targetMode: targetMode,
+                                               sawRequestedMode: sawRequestedMode) {
+            case .pending(let updatedSawRequestedMode):
+                sawRequestedMode = updatedSawRequestedMode
+            case .succeeded:
+                return
+            case .failed(let message):
+                throw VPNControllerError.failedToStart(message)
             }
 
-            Thread.sleep(forTimeInterval: 0.1)
+            if monitor.wait(until: deadline) == .timedOut {
+                break
+            }
+        }
+
+        switch evaluateModeSwitchWaitState(session: SessionState.load(),
+                                           pid: pid,
+                                           targetMode: targetMode,
+                                           sawRequestedMode: sawRequestedMode) {
+        case .pending:
+            break
+        case .succeeded:
+            return
+        case .failed(let message):
+            throw VPNControllerError.failedToStart(message)
         }
 
         throw VPNControllerError.failedToStart(
             "Timed out while waiting for mode switch to \(targetMode.modeDescription)."
         )
+    }
+
+    static func evaluateModeSwitchWaitState(session: SessionState?,
+                                            pid: Int32,
+                                            targetMode: AppTunnelMode,
+                                            sawRequestedMode: Bool) -> ModeSwitchWaitState {
+        var sawRequestedMode = sawRequestedMode
+
+        guard let session, session.pid == pid else {
+            return .pending(updatedSawRequestedMode: sawRequestedMode)
+        }
+
+        if session.requestedTunnelMode == targetMode {
+            sawRequestedMode = true
+        }
+
+        if session.phase == .failed {
+            return .failed(session.lastInfo ?? "Mode switch failed.")
+        }
+
+        if session.phase == .connected,
+           session.tunnelMode == targetMode,
+           session.requestedTunnelMode == nil {
+            return .succeeded
+        }
+
+        if sawRequestedMode,
+           session.phase == .connected,
+           session.requestedTunnelMode == nil,
+           session.tunnelMode != targetMode {
+            return .failed(
+                session.lastInfo ?? "Mode switch to \(targetMode.modeDescription) failed."
+            )
+        }
+
+        return .pending(updatedSawRequestedMode: sawRequestedMode)
     }
 
     private static var currentExecutablePath: String {
@@ -418,7 +485,7 @@ final class VPNController: NSObject {
             .standardized.path
     }
 
-    private static func validateSessionForPrivilegedCleanup(_ session: SessionState) throws {
+    static func validateSessionForPrivilegedCleanup(_ session: SessionState) throws {
         if let tunName = session.tunName,
            !tunName.isEmpty,
            !isSafeInterfaceName(tunName) {
@@ -432,6 +499,14 @@ final class VPNController: NSObject {
            !isSafeInterfaceName(physicalInterface) {
             throw VPNControllerError.unsafeSessionState(
                 "Refusing cleanup due to an unexpected physical interface name in session state."
+            )
+        }
+
+        if let physicalServiceName = session.physicalServiceName,
+           !physicalServiceName.isEmpty,
+           !isSafeNetworkServiceName(physicalServiceName) {
+            throw VPNControllerError.unsafeSessionState(
+                "Refusing cleanup due to an unexpected network service name in session state."
             )
         }
 
@@ -461,12 +536,42 @@ final class VPNController: NSObject {
         if let appliedResolverDomains = session.appliedResolverDomains,
            !appliedResolverDomains.allSatisfy({
                AppConfig.SplitTunnelConfiguration.isValidDomainName($0)
-               && isSafeResolverDomainFileName($0)
+               && ResolverPaths.isSafeDomainFileName($0)
            }) {
             throw VPNControllerError.unsafeSessionState(
                 "Refusing cleanup due to invalid resolver domains in session state."
             )
         }
+
+        if !isSafeUserControlledPath(session.profilePath) {
+            throw VPNControllerError.unsafeSessionState(
+                "Refusing cleanup due to an unexpected profile path in session state."
+            )
+        }
+    }
+
+    static func cleanupRouteManager(for session: SessionState) -> RouteManager {
+        var includedRoutes = session.appliedIncludedRoutes ?? []
+        var resolverDomains = session.appliedResolverDomains ?? []
+
+        if includedRoutes.isEmpty,
+           resolverDomains.isEmpty,
+           let configFilePath = session.configFilePath {
+            let expandedConfigPath = URL(fileURLWithPath: AppConfig.expandUserPath(configFilePath))
+                .standardized.path
+            if isSafeUserControlledPath(expandedConfigPath),
+               let configuration = try? AppConfig.load(explicitConfigPath: expandedConfigPath) {
+                includedRoutes = configuration.splitTunnel.includedRoutes
+                resolverDomains = configuration.splitTunnel.effectiveResolverDomains
+            }
+        }
+
+        return RouteManager(configuration: AppConfig.SplitTunnelConfiguration(
+            includedRoutes: includedRoutes,
+            resolverDomains: resolverDomains,
+            resolverNameServers: [],
+            reachabilityProbeHosts: nil
+        ))
     }
 
     private static func isSafeInterfaceName(_ value: String) -> Bool {
@@ -490,11 +595,65 @@ final class VPNController: NSObject {
         }
     }
 
-    private static func isSafeResolverDomainFileName(_ name: String) -> Bool {
-        guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else {
+    private static let safeNetworkServiceNameAllowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -./()_+'&")
+
+    private static func isSafeNetworkServiceName(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              !value.hasPrefix("-"),
+              value.count <= 128 else {
             return false
         }
-        return name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
+
+        return value.unicodeScalars.allSatisfy { safeNetworkServiceNameAllowedCharacters.contains($0) }
+    }
+
+    private static func isSafeUserControlledPath(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.hasPrefix("/"),
+              !value.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F || (0x80...0x9F).contains($0.value) }) else {
+            return false
+        }
+
+        let standardizedPath = URL(fileURLWithPath: value).standardized.path
+        let allowedRoots = [
+            "/Users/",
+            "/var/root/",
+            "/private/",
+            "/tmp/",
+        ]
+        return allowedRoots.contains(where: { standardizedPath.hasPrefix($0) })
+    }
+
+    @discardableResult
+    private static func signalValidatedProcess(pid: Int32,
+                                               expectedExecutablePath: String,
+                                               expectedStartTime: ProcessStartTime?,
+                                               signal: Int32) throws -> Bool {
+        guard processExists(pid) else {
+            return false
+        }
+
+        guard processMatchesExecutable(pid,
+                                       expectedExecutablePath: expectedExecutablePath,
+                                       expectedStartTime: expectedStartTime) else {
+            throw VPNControllerError.unsafeSessionState(
+                "Refusing to signal PID \(pid) because it does not match the expected \(AppIdentity.executableName) executable path."
+            )
+        }
+
+        if signal == 0 {
+            return true
+        }
+
+        if kill(pid, signal) == 0 {
+            return true
+        }
+
+        if errno == ESRCH {
+            return false
+        }
+
+        throw VPNControllerError.failedToStart("Failed to signal the active VPN controller process.")
     }
 
     static func printStatus() {
@@ -639,8 +798,12 @@ final class VPNController: NSObject {
         }
 
         if let capturedDNS = try? routeManager.captureCurrentDNSConfiguration(using: connectedState) {
-            connectedState.fullTunnelDNSServers = capturedDNS.dnsServers
-            connectedState.fullTunnelSearchDomains = capturedDNS.searchDomains
+            if !capturedDNS.dnsServers.isEmpty {
+                connectedState.fullTunnelDNSServers = capturedDNS.dnsServers
+            }
+            if !capturedDNS.searchDomains.isEmpty {
+                connectedState.fullTunnelSearchDomains = capturedDNS.searchDomains
+            }
         }
 
         if connectedState.fullTunnelDNSServers == nil {
@@ -706,7 +869,7 @@ final class VPNController: NSObject {
         }
 
         startRouteMonitorIfNeeded()
-        startCaffeinateIfNeeded()
+        startSleepAssertionIfNeeded()
         scheduleReachabilityProbeIfNeeded(reason: "initial split-tunnel connection")
 
         closeAuthenticationUI()
@@ -733,48 +896,19 @@ final class VPNController: NSObject {
 
     @MainActor
     private func presentWebAuth(_ request: WebAuthRequest) {
-        switch request.presentation {
-        case .externalBrowser:
-            EventLog.append(note: "Opening dedicated browser authentication session: \(request.url.absoluteString)", phase: sessionState.phase)
-            webAuthWindowController?.close()
-            webAuthWindowController = nil
-            externalWebAuthSession?.close()
-            let controller = ExternalWebAuthSession(url: request.url)
-            if controller.start() {
-                externalWebAuthSession = controller
-                emit("Opening browser for sign-in.")
-            } else {
-                EventLog.append(note: "Browser authentication session failed to start.", phase: sessionState.phase)
-                emit("The browser sign-in session could not be started.", level: .error)
-            }
-        case .embedded:
-            EventLog.append(note: "Preparing embedded web authentication window for \(request.url.absoluteString)", phase: sessionState.phase)
-            NSApplication.shared.setActivationPolicy(.regular)
-
-            let controller: WebAuthWindowController
-            if let existing = webAuthWindowController {
-                controller = existing
-                controller.load(url: request.url, hiddenInitially: request.hiddenInitially)
-            } else {
-                controller = WebAuthWindowController(url: request.url,
-                                                    hiddenInitially: request.hiddenInitially,
-                                                    userAgent: AppIdentity.reportedClientVersion)
-                controller.onStateEvent = { [weak self] event in
-                    switch event {
-                    case .actionRequired:
-                        controller.showWindow(nil)
-                    case .connectSuccess, .connectFailed:
-                        controller.close()
-                        self?.webAuthWindowController = nil
-                    case .locationChange(let title):
-                        controller.window?.title = title
-                    }
-                }
-                webAuthWindowController = controller
-                if !request.hiddenInitially {
-                    controller.showWindow(nil)
-                }
-            }
+        EventLog.append(note: "Opening dedicated browser authentication session: \(request.url.absoluteString)",
+                        phase: sessionState.phase)
+        externalWebAuthSession?.close()
+        let controller = ExternalWebAuthSession(url: request.url)
+        controller.onUserCancelled = { [weak self] in
+            self?.handleAuthenticationCancellation()
+        }
+        if controller.start() {
+            externalWebAuthSession = controller
+            emit("Opening browser for sign-in.")
+        } else {
+            EventLog.append(note: "Browser authentication session failed to start.", phase: sessionState.phase)
+            emit("The browser sign-in session could not be started.", level: .error)
         }
     }
 
@@ -793,6 +927,28 @@ final class VPNController: NSObject {
         } else {
             completeCleanupAndExit()
         }
+    }
+
+    @MainActor
+    private func handleAuthenticationCancellation() {
+        guard !requestedStop, !cleanupComplete else {
+            return
+        }
+
+        let message = "Browser sign-in was cancelled."
+        exitFailureMessage = message
+        sessionState.lastEvent = "AUTH_CANCELLED"
+        sessionState.lastInfo = message
+        try? saveState()
+        updateMenuBar()
+
+        if backgroundChild {
+            DetachedStartupStatus.writeFailure(message: message, to: startupStatusFilePath)
+        }
+
+        EventLog.append(note: message, phase: sessionState.phase)
+        emit(message, level: .error)
+        requestStop()
     }
 
     @MainActor
@@ -821,7 +977,7 @@ final class VPNController: NSObject {
         }
         cleanupComplete = true
         stopRouteMonitor()
-        stopCaffeinate()
+        stopSleepAssertion()
         EventLog.append(note: "Completing cleanup.", phase: sessionState.phase)
         var shouldRemoveSessionState = true
 
@@ -882,31 +1038,43 @@ final class VPNController: NSObject {
         guard tunnelMode == .split else {
             return
         }
-        guard routeMonitorTimer == nil else {
+        guard pathMonitor == nil else {
             return
         }
 
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + .seconds(15), repeating: .seconds(30))
-        timer.setEventHandler { [weak self] in
-            self?.performRouteHealthCheck()
+        let monitor = NWPathMonitor()
+        let relay = pathMonitorRelay
+        monitor.pathUpdateHandler = { path in
+            let status: String
+            switch path.status {
+            case .satisfied:
+                status = "satisfied"
+            case .requiresConnection:
+                status = "requires-connection"
+            case .unsatisfied:
+                status = "unsatisfied"
+            @unknown default:
+                status = "unknown"
+            }
+
+            let interfaces = path.availableInterfaces.map(\.name).sorted().joined(separator: ", ")
+            let reason = interfaces.isEmpty
+                ? "network path changed (\(status))"
+                : "network path changed (\(status); interfaces: \(interfaces))"
+
+            relay.deliver(reason: reason)
         }
-        timer.resume()
-        routeMonitorTimer = timer
-        startRouteChangeWatcherIfNeeded()
+        monitor.start(queue: pathMonitorQueue)
+        pathMonitor = monitor
+        hasSeenInitialPathUpdate = false
+        EventLog.append(note: "Started network path monitor.", phase: sessionState.phase)
     }
 
     @MainActor
     private func stopRouteMonitor() {
-        routeMonitorTimer?.cancel()
-        routeMonitorTimer = nil
-        routeMonitorOutputPipe?.fileHandleForReading.readabilityHandler = nil
-        routeMonitorOutputPipe = nil
-        if let routeMonitorProcess, routeMonitorProcess.isRunning {
-            routeMonitorProcess.terminate()
-        }
-        routeMonitorProcess = nil
-        routeMonitorBuffer.removeAll(keepingCapacity: false)
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        hasSeenInitialPathUpdate = false
         routeHealthCheckScheduled = false
     }
 
@@ -935,65 +1103,19 @@ final class VPNController: NSObject {
                 requestStop()
             }
         } catch {
-            emit("The route monitor failed: \(error.localizedDescription)", level: .error)
-            EventLog.append(note: "Route monitor failed: \(error.localizedDescription)", phase: sessionState.phase)
+            emit("The route health check failed: \(error.localizedDescription)", level: .error)
+            EventLog.append(note: "Route health check failed: \(error.localizedDescription)", phase: sessionState.phase)
         }
     }
 
     @MainActor
-    private func startRouteChangeWatcherIfNeeded() {
-        guard routeMonitorProcess == nil else {
+    @objc fileprivate func handlePathMonitorPayload(_ payload: PathMonitorPayload) {
+        if !hasSeenInitialPathUpdate {
+            hasSeenInitialPathUpdate = true
             return
         }
 
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/sbin/route")
-        process.arguments = ["-n", "monitor"]
-        process.standardOutput = pipe
-        process.standardError = pipe
-
-        let relay = routeMonitorRelay
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                return
-            }
-            relay.deliver(data)
-        }
-
-        do {
-            try process.run()
-            routeMonitorProcess = process
-            routeMonitorOutputPipe = pipe
-            EventLog.append(note: "Started route-change watcher.", phase: sessionState.phase)
-        } catch {
-            EventLog.append(note: "Failed to start route-change watcher: \(error.localizedDescription)",
-                            phase: sessionState.phase)
-        }
-    }
-
-    @MainActor
-    private func consumeRouteMonitorData(_ data: Data) {
-        routeMonitorBuffer.append(data)
-
-        while let newlineIndex = routeMonitorBuffer.firstIndex(of: 0x0A) {
-            let lineData = routeMonitorBuffer.subdata(in: 0..<newlineIndex)
-            routeMonitorBuffer.removeSubrange(0...newlineIndex)
-
-            let line = String(decoding: lineData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty else {
-                continue
-            }
-
-            // Already on the main actor; call directly without re-dispatching.
-            scheduleRouteHealthCheck(reason: line)
-        }
-    }
-
-    @MainActor
-    @objc fileprivate func handleRouteMonitorPayload(_ payload: RouteMonitorPayload) {
-        consumeRouteMonitorData(payload.data)
+        scheduleRouteHealthCheck(reason: payload.reason)
     }
 
     @MainActor
@@ -1006,7 +1128,7 @@ final class VPNController: NSObject {
         }
 
         routeHealthCheckScheduled = true
-        EventLog.append(note: "Route-change watcher noticed: \(reason)", phase: sessionState.phase)
+        EventLog.append(note: "Network path monitor noticed: \(reason)", phase: sessionState.phase)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
             guard let self else {
                 return
@@ -1080,12 +1202,12 @@ final class VPNController: NSObject {
 
         if requestedMode == tunnelMode {
             sessionState.requestedTunnelMode = nil
-            try saveState()
+            try saveState(preservingPendingModeSwitch: false)
             updateMenuBar()
             return
         }
 
-        emit("Switching to \(requestedMode.modeDescription) mode without reconnecting.")
+        emit("Switching to \(requestedMode.modeDescription) mode.")
         EventLog.append(note: "Applying in-place mode switch to \(requestedMode.modeDescription) (trigger: \(trigger)).",
                         phase: sessionState.phase)
 
@@ -1102,9 +1224,10 @@ final class VPNController: NSObject {
                                                     fullTunnelRoutes: updatedState.fullTunnelDefaultRoutes ?? [])
             }
         } catch {
-            // Try to preserve the previous mode behavior if transition fails.
             var rollbackState = sessionState
             rollbackState.requestedTunnelMode = nil
+            rollbackState.lastEvent = "MODE_SWITCH_FAILED"
+            rollbackState.lastInfo = "Mode switch to \(requestedMode.modeDescription) failed: \(error.localizedDescription)"
             if previousMode == .split {
                 _ = try? routeManager.applySplitTunnel(using: &rollbackState)
             } else {
@@ -1114,7 +1237,7 @@ final class VPNController: NSObject {
 
             sessionState = rollbackState
             tunnelMode = previousMode
-            try? saveState()
+            try? saveState(preservingPendingModeSwitch: false)
             updateMenuBar()
             throw error
         }
@@ -1122,6 +1245,7 @@ final class VPNController: NSObject {
         tunnelMode = requestedMode
         updatedState.tunnelMode = requestedMode
         updatedState.requestedTunnelMode = nil
+        updatedState.lastEvent = "MODE_SWITCHED"
         updatedState.lastInfo = nil
         sessionState = updatedState
 
@@ -1133,12 +1257,12 @@ final class VPNController: NSObject {
             reachabilityProbeInFlight = false
         }
 
-        try saveState()
+        try saveState(preservingPendingModeSwitch: false)
         updateMenuBar()
 
-        EventLog.append(note: "Mode switched to \(requestedMode.modeDescription) without reconnecting.",
+        EventLog.append(note: "Mode switched to \(requestedMode.modeDescription).",
                         phase: sessionState.phase)
-        emit("Mode switched to \(requestedMode.modeDescription) mode without reconnecting.")
+        emit("Mode switched to \(requestedMode.modeDescription) mode.")
     }
 
     @MainActor
@@ -1204,8 +1328,32 @@ final class VPNController: NSObject {
                                       reason: payload.reason)
     }
 
-    private func saveState() throws {
-        try sessionState.save()
+    static func sessionStateForSave(currentState: SessionState,
+                                    persistedState: SessionState?,
+                                    preservingPendingModeSwitch: Bool = true) -> SessionState {
+        guard preservingPendingModeSwitch,
+              currentState.requestedTunnelMode == nil,
+              currentState.phase == .connected || currentState.phase == .connecting || currentState.phase == .authPending,
+              let persistedState,
+              persistedState.pid == currentState.pid,
+              persistedState.executablePath == currentState.executablePath,
+              persistedState.processStartTime == currentState.processStartTime,
+              let pendingMode = persistedState.requestedTunnelMode,
+              currentState.phase != .connected || pendingMode != currentState.tunnelMode else {
+            return currentState
+        }
+
+        var mergedState = currentState
+        mergedState.requestedTunnelMode = pendingMode
+        return mergedState
+    }
+
+    private func saveState(preservingPendingModeSwitch: Bool = true) throws {
+        let preparedState = Self.sessionStateForSave(currentState: sessionState,
+                                                     persistedState: SessionState.load(),
+                                                     preservingPendingModeSwitch: preservingPendingModeSwitch)
+        sessionState = preparedState
+        try preparedState.save()
     }
 
     private func acquireControllerLock() throws {
@@ -1249,9 +1397,11 @@ final class VPNController: NSObject {
 
     private func startCleanupWatchdog() {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-
+        process.executableURL = URL(fileURLWithPath: Self.currentExecutablePath)
         process.arguments = ["cleanup-watchdog", "--parent-pid", String(getpid())]
+        process.standardInput = FileHandle(forReadingAtPath: "/dev/null")
+        process.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
+        process.standardError = FileHandle(forWritingAtPath: "/dev/null")
 
         do {
             try process.run()
@@ -1295,9 +1445,6 @@ final class VPNController: NSObject {
             return
         }
         EventLog.append(note: "System woke from sleep; disconnecting VPN.", phase: sessionState.phase)
-        // Sleep tears down the tunnel socket, so we always disconnect. The physical
-        // network often hasn't re-associated yet, which makes cleanup health checks
-        // look unhealthy — suppress that alert and show a single drop notice instead.
         disconnectingAfterWake = true
         UserAlert.showCritical(message: "VPN disconnected because your Mac slept. Reconnect when you are back online.")
         requestStop()
@@ -1489,42 +1636,39 @@ final class VPNController: NSObject {
 
     @MainActor
     private func closeAuthenticationUI() {
-        webAuthWindowController?.close()
-        webAuthWindowController = nil
         externalWebAuthSession?.close()
         externalWebAuthSession = nil
     }
 
-    private func startCaffeinateIfNeeded() {
+    private func startSleepAssertionIfNeeded() {
         guard !allowSleep else {
-            EventLog.append(note: "Idle sleep is allowed; skipping caffeinate.", phase: sessionState.phase)
+            EventLog.append(note: "Idle sleep is allowed; skipping the idle-sleep assertion.", phase: sessionState.phase)
             return
         }
-        guard caffeinateProcess == nil else {
+        guard sleepActivityToken == nil else {
             return
         }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-        process.arguments = ["-i"]
-        process.standardInput = FileHandle(forReadingAtPath: "/dev/null")
-        process.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
-        process.standardError = FileHandle(forWritingAtPath: "/dev/null")
-
-        do {
-            try process.run()
-            caffeinateProcess = process
-            EventLog.append(note: "Started caffeinate while VPN is connected.", phase: sessionState.phase)
-        } catch {
-            EventLog.append(note: "Failed to start caffeinate: \(error.localizedDescription)", phase: sessionState.phase)
+        if PowerManagement.isLowPowerModeEnabled {
+            EventLog.append(note: "Low Power Mode is enabled; allowing idle sleep while VPN is connected.", phase: sessionState.phase)
+            return
         }
+
+        if PowerManagement.isRunningOnBatteryPower {
+            EventLog.append(note: "Running on battery power; allowing idle sleep while VPN is connected.", phase: sessionState.phase)
+            return
+        }
+
+        sleepActivityToken = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled],
+                                                                   reason: "Keep CWRU OpenVPN active while connected")
+        EventLog.append(note: "Preventing idle sleep while VPN is connected.", phase: sessionState.phase)
     }
 
-    private func stopCaffeinate() {
-        if let caffeinateProcess, caffeinateProcess.isRunning {
-            caffeinateProcess.terminate()
+    private func stopSleepAssertion() {
+        if let sleepActivityToken {
+            ProcessInfo.processInfo.endActivity(sleepActivityToken)
         }
-        caffeinateProcess = nil
+        sleepActivityToken = nil
     }
 
     @MainActor
@@ -1534,6 +1678,11 @@ final class VPNController: NSObject {
         }
 
         let controller = MenuBarController()
+        controller.onSwitchMode = { [weak self] in
+            Task { @MainActor in
+                self?.requestMenuBarModeSwitch()
+            }
+        }
         controller.onDisconnect = { [weak self] in
             Task { @MainActor in
                 self?.requestStop()
@@ -1546,6 +1695,7 @@ final class VPNController: NSObject {
     private func updateMenuBar() {
         menuBarController?.update(with: MenuBarSnapshot(phase: sessionState.phase,
                                                         tunnelMode: tunnelMode,
+                                                        requestedTunnelMode: sessionState.requestedTunnelMode,
                                                         statusText: Self.statusTitle(for: sessionState.phase,
                                                                                      stale: false,
                                                                                      recoveryNeeded: false),
@@ -1553,9 +1703,15 @@ final class VPNController: NSObject {
     }
 
     private func menuBarDetailText() -> String {
-        if sessionState.phase == .connected,
-           let requestedTunnelMode = sessionState.requestedTunnelMode {
-            return "Switching to \(requestedTunnelMode.displayName)"
+        if let requestedTunnelMode = sessionState.requestedTunnelMode {
+            switch sessionState.phase {
+            case .connected:
+                return "Switching to \(requestedTunnelMode.displayName)"
+            case .connecting, .authPending:
+                return "Pending mode: \(requestedTunnelMode.displayName)"
+            case .disconnecting, .failed, .disconnected:
+                break
+            }
         }
 
         switch sessionState.phase {
@@ -1577,18 +1733,54 @@ final class VPNController: NSObject {
         }
     }
 
+    @MainActor
+    private func requestMenuBarModeSwitch() {
+        guard !cleanupComplete, !requestedStop else {
+            return
+        }
+
+        let targetMode = tunnelMode == .split ? AppTunnelMode.full : .split
+
+        switch sessionState.phase {
+        case .connected:
+            do {
+                try applyModeSwitch(to: targetMode, trigger: "menu bar")
+            } catch {
+                emit("Mode switch failed: \(error.localizedDescription)", level: .error)
+                EventLog.append(note: "Mode switch failed: \(error.localizedDescription)", phase: sessionState.phase)
+            }
+
+        case .connecting, .authPending:
+            sessionState.requestedTunnelMode = targetMode
+            do {
+                try saveState()
+                updateMenuBar()
+                emit("Queued \(targetMode.modeDescription) mode switch for after connection.")
+                EventLog.append(note: "Queued mode switch to \(targetMode.modeDescription) from the menu bar.",
+                                phase: sessionState.phase)
+            } catch {
+                sessionState.requestedTunnelMode = nil
+                emit("Could not queue mode switch: \(error.localizedDescription)", level: .error)
+                EventLog.append(note: "Could not queue mode switch: \(error.localizedDescription)",
+                                phase: sessionState.phase)
+            }
+
+        case .disconnecting, .disconnected, .failed:
+            break
+        }
+    }
+
     private func redactForDisplay(_ value: String) -> String {
         if value.hasPrefix("WEB_AUTH:") || value.hasPrefix("OPEN_URL:") {
             return "Browser sign-in required."
         }
 
-        return value
-            .replacingOccurrences(of: #"\[auth-token\]\s+[^\s\n]+"#,
-                                  with: "[auth-token] [redacted]",
-                                  options: .regularExpression)
-            .replacingOccurrences(of: #"https?://cwru\.openvpn\.com/connect[^\s\n]*"#,
-                                  with: "https://cwru.openvpn.com/connect?[redacted]",
-                                  options: .regularExpression)
+        return redactSensitiveText(value)
+    }
+
+    @MainActor
+    func terminalFailureMessage() -> String? {
+        exitFailureMessage
     }
 
     static func recoveryDetail(for session: SessionState, stale: Bool) -> String? {
@@ -1642,4 +1834,10 @@ final class VPNController: NSObject {
         }
     }
 
+}
+
+enum ModeSwitchWaitState {
+    case pending(updatedSawRequestedMode: Bool)
+    case succeeded
+    case failed(String)
 }
