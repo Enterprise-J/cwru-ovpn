@@ -10,7 +10,7 @@ Native macOS client for Case Western Reserve University OpenVPN profiles, built 
 
 - Browser-based authentication against OpenVPN CloudConnexa and CWRU SSO.
 - Full- and split-tunnel modes, switchable in place without dropping the session.
-- Scoped DNS resolvers in split-tunnel mode; physical IPv6 disabled for split-tunnel isolation and when full-tunnel safety checks need it.
+- Scoped split-tunnel DNS, with IPv6 leak protection for split- and full-tunnel modes.
 - Lightweight implementation. No launch daemons, no login items.
 
 ## Installation
@@ -40,10 +40,10 @@ By default, `cwru-ovpn` tries to prevent idle sleep while connected. Pass `--all
 
 ## Advanced
 
-Use the installed binary directly for foreground mode, debug logging, explicit config files, or profile imports.
+Use the installed binary directly for foreground mode, debug logging, explicit config files, or profile imports. The command comes immediately after the binary, and options belong to that command; there are no global options.
 
 ```bash
-sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn [command] [options]
+sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn <command> [that-command's-options]
 ```
 
 | Command | Purpose |
@@ -58,21 +58,21 @@ sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn [command] [options]
 | `version` | Print the version number |
 | `help` | Show the built-in help text |
 
-| Syntax | Purpose |
+| Command | Option | Purpose |
 | --- | --- |
-| `--config PATH` | Use a specific config JSON file |
-| `--verbosity silent\|daily\|debug` | Override the configured log level |
-| `--mode full\|split` | Override the configured tunnel mode |
-| `--allow-sleep` | Allow the Mac to idle sleep for this run |
-| `--foreground` | Keep the controller attached to the terminal |
-| `disconnect --force` | Drop stale state even if cleanup still reports the network as unhealthy; `ovpnd` intentionally does not forward this flag |
-| `logs --tail COUNT` | Show the last `COUNT` event log entries; defaults to `40` |
-| `setup --profile PATH` | Copy a profile to `~/.cwru-ovpn/profile.ovpn` before installing sudoers |
-| `uninstall --purge` | Also remove `~/.cwru-ovpn` after uninstalling shell integration |
+| `connect` | `--config PATH` | Use a specific config JSON file |
+| `connect` | `--verbosity silent\|daily\|debug` | Override the configured log level |
+| `connect` | `--mode full\|split` | Override the configured tunnel mode; `--tunnel-mode` is also accepted |
+| `connect` | `--allow-sleep` | Allow the Mac to idle sleep for this run |
+| `connect` | `--foreground` | Keep the controller attached to the terminal |
+| `disconnect` | `--force` or `-f` | Drop stale state even if cleanup still reports the network as unhealthy; `ovpnd` intentionally does not forward this flag |
+| `logs` | `--tail COUNT` | Show the last `COUNT` event log entries; defaults to `40` |
+| `setup` | `--profile PATH` | Copy a profile to `~/.cwru-ovpn/profile.ovpn` before installing sudoers |
+| `uninstall` | `--purge` | Also remove `~/.cwru-ovpn` after uninstalling shell integration |
 
 Read-only commands such as `status`, `logs`, `doctor`, `version`, and `help` can run without `sudo`.
 
-Passwordless `sudo` covers the canonical `connect` forms, `disconnect`, `disconnect -f`, `disconnect --force`, and plain `setup`. `connect --config PATH ...`, `connect --foreground` without `--verbosity debug`, and non-canonical argument orders may still prompt for an admin password.
+Passwordless `sudo` is order-sensitive. It covers `connect`, `connect --mode full`, `connect --mode split`, those same forms with `--verbosity debug` or `--verbosity debug --foreground`, and any of those forms with trailing `--allow-sleep`. It also covers `disconnect`, `disconnect -f`, `disconnect --force`, and plain `setup`. `connect --config PATH ...`, `connect --foreground` without `--verbosity debug`, and non-canonical argument orders may still prompt for an admin password.
 
 Foreground debug:
 
