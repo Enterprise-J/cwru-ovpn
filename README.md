@@ -59,7 +59,7 @@ sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn <command> [that-command'
 | `help` | Show the built-in help text |
 
 | Command | Option | Purpose |
-| --- | --- |
+| --- | --- | --- |
 | `connect` | `--config PATH` | Use a specific config JSON file |
 | `connect` | `--verbosity silent\|daily\|debug` | Override the configured log level |
 | `connect` | `--mode full\|split` | Override the configured tunnel mode; `--tunnel-mode` is also accepted |
@@ -72,7 +72,13 @@ sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn <command> [that-command'
 
 Read-only commands such as `status`, `logs`, `doctor`, `version`, and `help` can run without `sudo`.
 
-Passwordless `sudo` is order-sensitive. It covers `connect`, `connect --mode full`, `connect --mode split`, those same forms with `--verbosity debug` or `--verbosity debug --foreground`, and any of those forms with trailing `--allow-sleep`. It also covers `disconnect`, `disconnect -f`, `disconnect --force`, and plain `setup`. `connect --config PATH ...`, `connect --foreground` without `--verbosity debug`, and non-canonical argument orders may still prompt for an admin password.
+Passwordless `sudo` is order-sensitive and covers only:
+
+- `connect`, `connect --mode full`, and `connect --mode split`
+- Those same `connect` forms with `--verbosity debug`, optional `--foreground`, and optional trailing `--allow-sleep`
+- `disconnect`, `disconnect -f`, `disconnect --force`, and plain `setup`
+
+Other forms, including `connect --config PATH ...`, `connect --foreground` without `--verbosity debug`, and non-canonical argument orders, may still prompt for an admin password.
 
 Foreground debug:
 
