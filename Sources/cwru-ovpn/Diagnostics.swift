@@ -60,9 +60,9 @@ enum Diagnostics {
         let configURL = AppConfig.resolvedConfigURL(explicitConfigPath: session?.configFilePath)
         let config = try? AppConfig.load(explicitConfigPath: session?.configFilePath)
         let sudoersPath = "/etc/sudoers.d/cwru-ovpn"
-        let executablePath = URL(fileURLWithPath: CommandLine.arguments[0])
-            .resolvingSymlinksInPath()
-            .standardized.path
+        let executablePath = (try? ExecutionIdentity.currentExecutablePath())
+            ?? CommandLine.arguments.first
+            ?? AppIdentity.executableName
 
         print("Executable: \(executablePath)")
         print("Version: \(AppIdentity.version)")

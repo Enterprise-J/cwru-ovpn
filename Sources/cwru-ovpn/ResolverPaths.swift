@@ -21,6 +21,9 @@ enum ResolverPaths {
     }
 
     static func fileURL(for domain: String) -> URL {
-        directory.appendingPathComponent(domain)
+        guard isSafeDomainFileName(domain) else {
+            preconditionFailure("Invalid resolver domain file name: \(domain)")
+        }
+        return directory.appendingPathComponent(domain)
     }
 }

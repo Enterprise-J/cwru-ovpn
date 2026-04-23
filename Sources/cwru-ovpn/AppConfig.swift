@@ -272,15 +272,10 @@ struct AppConfig: Codable {
 
     static func expandUserPath(_ path: String) -> String {
         if getuid() == 0,
-           path == "~" || path.hasPrefix("~/") {
-            let environment = ProcessInfo.processInfo.environment
-            if let sudoUser = environment["SUDO_USER"],
-               !sudoUser.isEmpty,
-               sudoUser != "root" {
-                let userHome = NSString(string: "~\(sudoUser)").expandingTildeInPath
-                let suffix = String(path.dropFirst())
-                return userHome + suffix
-            }
+           path == "~" || path.hasPrefix("~/"),
+           let sudoIdentity = try? ExecutionIdentity.validatedSudoUserIfAvailable() {
+            let suffix = String(path.dropFirst())
+            return sudoIdentity.homeDirectory.path + suffix
         }
         return NSString(string: path).expandingTildeInPath
     }

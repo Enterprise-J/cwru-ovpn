@@ -47,13 +47,32 @@ private func redactHTTPURLQueryStrings(in value: String) -> String {
         }
 
         let matchedURL = String(redacted[range])
-        guard (matchedURL.hasPrefix("https://") || matchedURL.hasPrefix("http://")),
-              let queryStart = matchedURL.firstIndex(of: "?") else {
+        let normalizedURL = matchedURL.lowercased()
+        guard normalizedURL.hasPrefix("https://") || normalizedURL.hasPrefix("http://") else {
             continue
         }
 
-        let fragment = matchedURL[queryStart...].firstIndex(of: "#").map { String(matchedURL[$0...]) } ?? ""
-        let replacement = String(matchedURL[..<queryStart]) + "?[redacted]" + fragment
+        let queryStart = matchedURL.firstIndex(of: "?")
+        let fragmentStart = matchedURL.firstIndex(of: "#")
+        guard queryStart != nil || fragmentStart != nil else {
+            continue
+        }
+
+        let cutoff: String.Index
+        switch (queryStart, fragmentStart) {
+        case let (query?, fragment?):
+            cutoff = min(query, fragment)
+        case let (query?, nil):
+            cutoff = query
+        case let (nil, fragment?):
+            cutoff = fragment
+        case (nil, nil):
+            continue
+        }
+
+        let replacement = String(matchedURL[..<cutoff])
+            + (queryStart == cutoff ? "?[redacted]" : "")
+            + (fragmentStart == cutoff || (fragmentStart != nil && queryStart == cutoff) ? "#[redacted]" : "")
         redacted.replaceSubrange(range, with: replacement)
     }
 
@@ -155,7 +174,7 @@ enum EventLog {
     private static func openEventLogForAppend() throws -> FileHandle {
         let path = RuntimePaths.eventLogFile.path
         let fd = open(path,
-                      O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_CREAT,
+                      O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_CREAT | O_NONBLOCK,
                       mode_t(S_IRUSR | S_IWUSR))
         let openError = errno
         guard fd >= 0 else {
@@ -183,11 +202,8 @@ enum EventLog {
             throw POSIXError(POSIXErrorCode(rawValue: chmodError) ?? .EIO)
         }
 
-        let environment = ProcessInfo.processInfo.environment
-        if getuid() == 0,
-           let sudoUID = environment["SUDO_UID"].flatMap(UInt32.init),
-           let sudoGID = environment["SUDO_GID"].flatMap(UInt32.init),
-           fchown(fd, sudoUID, sudoGID) != 0 {
+        if let sudoIdentity = try? ExecutionIdentity.validatedSudoUserIfAvailable(),
+           fchown(fd, sudoIdentity.userID, sudoIdentity.groupID) != 0 {
             let chownError = errno
             close(fd)
             throw POSIXError(POSIXErrorCode(rawValue: chownError) ?? .EIO)

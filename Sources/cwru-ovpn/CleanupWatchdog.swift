@@ -1,7 +1,7 @@
 import Foundation
 
 enum CleanupWatchdog {
-    static func run(parentPID: Int32) {
+    static func run(parentPID: Int32, parentStartTime: ProcessStartTime?) {
         let source = DispatchSource.makeProcessSource(
             identifier: pid_t(parentPID),
             eventMask: .exit,
@@ -10,16 +10,16 @@ enum CleanupWatchdog {
 
         source.setEventHandler {
             source.cancel()
-            performCleanup(parentPID: parentPID)
+            performCleanup(parentPID: parentPID, parentStartTime: parentStartTime)
             exit(0)
         }
 
         source.resume()
 
         DispatchQueue.main.async {
-            if !processExists(parentPID) || SessionState.load() == nil {
+            if !processExists(parentPID, expectedStartTime: parentStartTime) || SessionState.load() == nil {
                 source.cancel()
-                performCleanup(parentPID: parentPID)
+                performCleanup(parentPID: parentPID, parentStartTime: parentStartTime)
                 exit(0)
             }
         }
@@ -27,12 +27,13 @@ enum CleanupWatchdog {
         dispatchMain()
     }
 
-    static func performCleanup(parentPID: Int32) {
+    static func performCleanup(parentPID: Int32, parentStartTime: ProcessStartTime?) {
         guard let session = SessionState.load() else {
             return
         }
 
-        guard session.pid == parentPID else {
+        guard session.pid == parentPID,
+              parentStartTime == nil || session.processStartTime == parentStartTime else {
             EventLog.append(note: "Cleanup watchdog ignored session state for unexpected PID \(session.pid).",
                             phase: .failed)
             return

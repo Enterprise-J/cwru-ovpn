@@ -159,12 +159,8 @@ enum RuntimePaths {
     }
 
     private static func resolvedHomeDirectory() -> URL {
-        let environment = ProcessInfo.processInfo.environment
-        if getuid() == 0,
-           let sudoUser = environment["SUDO_USER"],
-           !sudoUser.isEmpty,
-           let homePath = NSHomeDirectoryForUser(sudoUser) {
-            return URL(fileURLWithPath: homePath, isDirectory: true)
+        if let sudoIdentity = try? ExecutionIdentity.validatedSudoUserIfAvailable() {
+            return sudoIdentity.homeDirectory
         }
         return FileManager.default.homeDirectoryForCurrentUser
     }
@@ -260,13 +256,9 @@ enum RuntimePaths {
         ]
 
         if ownershipPolicy == .sudoUserWhenAvailable,
-           getuid() == 0 {
-            let environment = ProcessInfo.processInfo.environment
-            if let sudoUID = environment["SUDO_UID"].flatMap(Int.init),
-               let sudoGID = environment["SUDO_GID"].flatMap(Int.init) {
-                attributes[.ownerAccountID] = sudoUID
-                attributes[.groupOwnerAccountID] = sudoGID
-            }
+           let sudoIdentity = try? ExecutionIdentity.validatedSudoUserIfAvailable() {
+            attributes[.ownerAccountID] = Int(sudoIdentity.userID)
+            attributes[.groupOwnerAccountID] = Int(sudoIdentity.groupID)
         }
 
         try FileManager.default.setAttributes(attributes, ofItemAtPath: url.path)

@@ -39,6 +39,15 @@ private struct ActiveDNSResolver {
     }
 }
 
+private struct ActiveDefaultResolverLeakState {
+    var usesVPNNameServers = false
+    var overlapsVPNSearchDomains = false
+
+    var needsRepair: Bool {
+        usesVPNNameServers || overlapsVPNSearchDomains
+    }
+}
+
 enum RouteManagerError: LocalizedError {
     case couldNotDeterminePhysicalGateway
     case failedToRestoreFullTunnelRoutes
@@ -121,9 +130,8 @@ struct RouteManager {
         var mutatedNetwork = false
 
         do {
-            try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
-            // Only mark the network as mutated after the first route change succeeds.
             mutatedNetwork = true
+            try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
             for route in cleanupIncludedRoutes(using: state) {
                 _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
             }
@@ -138,7 +146,9 @@ struct RouteManager {
             try installResolverFiles(using: state)
             try restoreDNSConfiguration(using: state)
             try flushDNS()
-            try validateSplitTunnelPrivacy(using: state)
+            if try validateSplitTunnelPrivacy(using: state) {
+                try flushDNS()
+            }
 
             state.appliedIncludedRoutes = cleanupIncludedRoutes(using: state)
             state.appliedResolverDomains = cleanupResolverDomains(using: state)
@@ -175,51 +185,60 @@ struct RouteManager {
             return
         }
         let validatedTunnelName = try validatedTunnelInterfaceName(tunnelName)
+        var splitDefaultsRemoved = false
 
-        for route in cleanupIncludedRoutes(using: state) {
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
-        }
-
-        // Remove split default-route overrides and route all IPv4 traffic via tunnel.
-        _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "0.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
-        _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "128.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
-
-        let routesToRestore = resolvedFullTunnelDefaultRoutes(from: fullTunnelRoutes, tunnelName: validatedTunnelName)
-        for route in routesToRestore {
-            switch route.nextHopKind {
-            case .gateway:
-                _ = try Shell.run("/sbin/route",
-                                  arguments: ["-n", "add", "-net", route.destination, route.nextHopValue],
-                                  allowNonZero: true,
-                                  requirePrivileges: true)
-            case .interface:
-                _ = try Shell.run("/sbin/route",
-                                  arguments: ["-n", "add", "-net", route.destination, "-interface", route.nextHopValue],
-                                  allowNonZero: true,
-                                  requirePrivileges: true)
+        do {
+            for route in cleanupIncludedRoutes(using: state) {
+                _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
             }
+
+            // Remove split default-route overrides and route all IPv4 traffic via tunnel.
+            _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "0.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
+            _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "128.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
+            splitDefaultsRemoved = true
+
+            let routesToRestore = resolvedFullTunnelDefaultRoutes(from: fullTunnelRoutes, tunnelName: validatedTunnelName)
+            for route in routesToRestore {
+                switch route.nextHopKind {
+                case .gateway:
+                    _ = try Shell.run("/sbin/route",
+                                      arguments: ["-n", "add", "-net", route.destination, route.nextHopValue],
+                                      allowNonZero: true,
+                                      requirePrivileges: true)
+                case .interface:
+                    _ = try Shell.run("/sbin/route",
+                                      arguments: ["-n", "add", "-net", route.destination, "-interface", route.nextHopValue],
+                                      allowNonZero: true,
+                                      requirePrivileges: true)
+                }
+            }
+
+            if !(try fullTunnelRoutesMatch(routesToRestore)) {
+                throw RouteManagerError.failedToRestoreFullTunnelRoutes
+            }
+
+            try restoreFullTunnelDNS(using: state)
+            try restorePhysicalIPv6Configuration(using: state)
+            try removeResolverFiles(using: state)
+            try flushDNS()
+            try applyFullTunnelSafety(using: state)
+
+            state.fullTunnelDefaultRoutes = routesToRestore
+            state.fullTunnelDNSServers = firstNonEmptyList(state.fullTunnelDNSServers,
+                                                           state.pushedDNSServers,
+                                                           state.originalDNSServers)
+                .filter(AppConfig.SplitTunnelConfiguration.isValidIPAddress)
+            state.fullTunnelSearchDomains = firstNonEmptyList(state.fullTunnelSearchDomains,
+                                                              state.pushedSearchDomains,
+                                                              state.originalSearchDomains)
+                .filter(AppConfig.SplitTunnelConfiguration.isValidDomainName)
+            state.routesApplied = false
+        } catch {
+            if splitDefaultsRemoved {
+                try? installFailClosedTunnelDefaultRoutes(tunnelName: validatedTunnelName)
+            }
+            throw error
         }
-
-        if !(try fullTunnelRoutesMatch(routesToRestore)) {
-            throw RouteManagerError.failedToRestoreFullTunnelRoutes
-        }
-
-        try restoreFullTunnelDNS(using: state)
-        try restorePhysicalIPv6Configuration(using: state)
-        try removeResolverFiles(using: state)
-        try flushDNS()
-        try applyFullTunnelSafety(using: state)
-
-        state.fullTunnelDefaultRoutes = routesToRestore
-        state.fullTunnelDNSServers = firstNonEmptyList(state.fullTunnelDNSServers,
-                                                       state.pushedDNSServers,
-                                                       state.originalDNSServers)
-            .filter(AppConfig.SplitTunnelConfiguration.isValidIPAddress)
-        state.fullTunnelSearchDomains = firstNonEmptyList(state.fullTunnelSearchDomains,
-                                                          state.pushedSearchDomains,
-                                                          state.originalSearchDomains)
-            .filter(AppConfig.SplitTunnelConfiguration.isValidDomainName)
-        state.routesApplied = false
     }
 
     func captureCurrentFullTunnelDefaultRoutes(tunnelName: String?) throws -> [ManagedIPv4Route] {
@@ -298,6 +317,7 @@ struct RouteManager {
 
         let routingTable = try routingTableEntries()
         var needsRepair = false
+        var shouldFlushDNS = false
 
         for route in cleanupIncludedRoutes(using: state) {
             if !routeExists(route, on: validatedTunnelName, in: routingTable) {
@@ -311,14 +331,26 @@ struct RouteManager {
         }
 
         if needsRepair {
-            try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", "0.0.0.0/1", gateway], allowNonZero: true, requirePrivileges: true)
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", "128.0.0.0/1", gateway], allowNonZero: true, requirePrivileges: true)
-            for route in cleanupIncludedRoutes(using: state) {
-                _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
-                _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", route, "-interface", validatedTunnelName], allowNonZero: true, requirePrivileges: true)
+            do {
+                try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
+                try installSplitDefaultRoutes(gateway: gateway)
+                for route in cleanupIncludedRoutes(using: state) {
+                    _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
+                    _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", route, "-interface", validatedTunnelName], allowNonZero: true, requirePrivileges: true)
+                }
+            } catch {
+                try? installSplitTunnelRouting(using: state,
+                                               gateway: gateway,
+                                               tunnelName: validatedTunnelName)
+                throw error
             }
-            try validateSplitTunnelPrivacy(using: state)
+            shouldFlushDNS = true
+        }
+
+        if try validateSplitTunnelPrivacy(using: state) {
+            shouldFlushDNS = true
+        }
+        if shouldFlushDNS {
             try flushDNS()
         }
 
@@ -327,32 +359,23 @@ struct RouteManager {
 
     @discardableResult
     func cleanup(using state: SessionState) throws -> Bool {
-        for route in cleanupIncludedRoutes(using: state) {
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
-        }
-        try removeOpenVPNDefaultRoutes(tunnelName: state.tunName)
-        _ = try removeRemoteHostRoutes(forProfilePath: state.profilePath,
-                                       preferredRemoteIP: state.serverIP,
-                                       resolveDNS: false)
-
-        try restoreDefaultRouteIfNecessary(using: state)
-        try restoreDNSConfiguration(using: state)
-        try restorePhysicalIPv6Configuration(using: state)
-
-        try removeResolverFiles(using: state)
-        try flushDNS()
+        var cleanupErrors: [Error] = []
+        performCleanupAttempt(using: state, errors: &cleanupErrors)
 
         if try validateCleanupState(using: state) {
             return true
         }
 
-        try restoreDefaultRouteIfNecessary(using: state)
-        try restoreDNSConfiguration(using: state)
-        try restorePhysicalIPv6Configuration(using: state)
-        try removeResolverFiles(using: state)
-        try flushDNS()
+        performCleanupAttempt(using: state, errors: &cleanupErrors)
+        if try validateCleanupState(using: state) {
+            return true
+        }
 
-        return try validateCleanupState(using: state)
+        if let firstError = cleanupErrors.first {
+            throw firstError
+        }
+
+        return false
     }
 
     func flushDNS() throws {
@@ -451,14 +474,33 @@ struct RouteManager {
     }
 
     private func removeOpenVPNDefaultRoutes(tunnelName: String?) throws {
-        _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "0.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
-        _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "128.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
-
-        guard let tunnelName, !tunnelName.isEmpty else {
-            return
+        let validatedTunnelName: String?
+        if let tunnelName, !tunnelName.isEmpty {
+            validatedTunnelName = try? validatedTunnelInterfaceName(tunnelName)
+        } else {
+            validatedTunnelName = nil
         }
 
-        try removeOpenVPNIPv6DefaultRoutes(tunnelName: try validatedTunnelInterfaceName(tunnelName))
+        _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "0.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
+
+        var firstError: Error?
+        do {
+            _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "128.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
+        } catch {
+            firstError = error
+        }
+
+        if let validatedTunnelName {
+            do {
+                try removeOpenVPNIPv6DefaultRoutes(tunnelName: validatedTunnelName)
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+
+        if let firstError {
+            throw firstError
+        }
     }
 
     private func removeOpenVPNIPv6DefaultRoutes(tunnelName: String) throws {
@@ -527,23 +569,29 @@ struct RouteManager {
                           requirePrivileges: true)
     }
 
-    private func validateSplitTunnelPrivacy(using state: SessionState) throws {
-        try validatePhysicalDNSRestored(using: state)
-        try validateResolverFiles(using: state)
-        try validatePhysicalIPv6Disabled(using: state)
-        try validateActiveDefaultResolverIsolation(using: state)
+    @discardableResult
+    private func validateSplitTunnelPrivacy(using state: SessionState) throws -> Bool {
+        var changed = false
+        changed = try validatePhysicalDNSRestored(using: state) || changed
+        changed = try validateResolverFiles(using: state) || changed
+        changed = try validatePhysicalIPv6Disabled(using: state) || changed
+        changed = try validateActiveDefaultResolverIsolation(using: state) || changed
+        return changed
     }
 
     private func validateCleanupState(using state: SessionState) throws -> Bool {
-        try cleanupDefaultRouteLooksHealthy(using: state)
-        && cleanupPhysicalDNSLooksHealthy(using: state)
-        && cleanupResolversRemoved(using: state)
-        && cleanupPhysicalIPv6LooksHealthy(using: state)
+        let routingTable = try routingTableEntries()
+        return try cleanupDefaultRouteLooksHealthy(using: state)
+            && cleanupPhysicalDNSLooksHealthy(using: state)
+            && cleanupResolversRemoved(using: state)
+            && cleanupPhysicalIPv6LooksHealthy(using: state)
+            && cleanupIncludedRoutesRemoved(using: state, in: routingTable)
+            && cleanupRemoteHostRoutesRemoved(using: state, in: routingTable)
     }
 
-    private func validatePhysicalDNSRestored(using state: SessionState) throws {
+    private func validatePhysicalDNSRestored(using state: SessionState) throws -> Bool {
         guard let current = try currentDNSConfiguration(using: state) else {
-            return
+            return false
         }
 
         let expectedDNSServers = state.originalDNSServers ?? []
@@ -553,7 +601,10 @@ struct RouteManager {
             EventLog.append(note: "Split-tunnel privacy check restored physical-service DNS configuration.",
                             phase: state.phase)
             try restoreDNSConfiguration(using: state)
+            return true
         }
+
+        return false
     }
 
     private func cleanupPhysicalDNSLooksHealthy(using state: SessionState) throws -> Bool {
@@ -574,11 +625,11 @@ struct RouteManager {
         return true
     }
 
-    private func validateResolverFiles(using state: SessionState) throws {
+    private func validateResolverFiles(using state: SessionState) throws -> Bool {
         let nameServers = resolverNameServers(for: state)
         let resolverDomains = cleanupResolverDomains(using: state)
         guard !resolverDomains.isEmpty, !nameServers.isEmpty else {
-            return
+            return false
         }
 
         for domain in resolverDomains {
@@ -589,9 +640,11 @@ struct RouteManager {
                 EventLog.append(note: "Split-tunnel privacy check refreshed scoped resolver files.",
                                 phase: state.phase)
                 try installResolverFiles(using: state)
-                return
+                return true
             }
         }
+
+        return false
     }
 
     private func currentDNSConfiguration(using state: SessionState) throws -> PhysicalDNSConfiguration? {
@@ -629,14 +682,14 @@ struct RouteManager {
                           requirePrivileges: true)
     }
 
-    private func validatePhysicalIPv6Disabled(using state: SessionState) throws {
+    private func validatePhysicalIPv6Disabled(using state: SessionState) throws -> Bool {
         guard let serviceName = state.physicalServiceName, !serviceName.isEmpty else {
-            return
+            return false
         }
 
         let originalMode = normalizedIPv6Mode(state.originalIPv6Mode)
         guard originalMode != nil, originalMode != "off" else {
-            return
+            return false
         }
 
         let currentMode = normalizedIPv6Mode(try ipv6Mode(forServiceNamed: serviceName))
@@ -644,12 +697,15 @@ struct RouteManager {
             EventLog.append(note: "Split-tunnel privacy check re-disabled physical-service IPv6.",
                             phase: state.phase)
             try disablePhysicalIPv6ForSplitTunnel(using: state)
+            return true
         }
+
+        return false
     }
 
-    private func validateActiveDefaultResolverIsolation(using state: SessionState) throws {
-        guard activeDefaultResolverUsesVPNDNS(using: state) else {
-            return
+    private func validateActiveDefaultResolverIsolation(using state: SessionState) throws -> Bool {
+        guard activeDefaultResolverLeakState(using: state).needsRepair else {
+            return false
         }
 
         EventLog.append(note: "Split-tunnel privacy check restored the active default DNS resolver.",
@@ -657,9 +713,12 @@ struct RouteManager {
         try restoreDNSConfiguration(using: state)
         try flushDNS()
 
-        guard !activeDefaultResolverUsesVPNDNS(using: state) else {
+        let postRepairLeak = waitForActiveDefaultResolverLeakState(using: state)
+        guard !postRepairLeak.usesVPNNameServers else {
             throw RouteManagerError.failedToIsolateSplitTunnelDNS
         }
+
+        return true
     }
 
     private func cleanupPhysicalIPv6LooksHealthy(using state: SessionState) throws -> Bool {
@@ -720,6 +779,101 @@ struct RouteManager {
 
         // Cleanup only has to move the default route off the VPN tunnel; roaming can change the gateway.
         return !currentInterface.hasPrefix("utun") && !currentInterface.hasPrefix("ppp")
+    }
+
+    private func cleanupIncludedRoutesRemoved(using state: SessionState,
+                                              in entries: [RouteEntry]) -> Bool {
+        for route in cleanupIncludedRoutes(using: state) {
+            guard let canonicalRoute = Self.canonicalIPv4Route(route) else {
+                continue
+            }
+
+            let routeStillPresent = entries.contains { entry in
+                guard let entryRoute = Self.canonicalIPv4Route(entry.destination) else {
+                    return false
+                }
+                return entryRoute == canonicalRoute
+                    && (entry.interfaceName.hasPrefix("utun") || entry.interfaceName.hasPrefix("ppp"))
+            }
+
+            if routeStillPresent {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    private func cleanupRemoteHostRoutesRemoved(using state: SessionState,
+                                                in entries: [RouteEntry]) -> Bool {
+        let remoteIPs = resolveRemoteIPv4Addresses(fromProfilePath: state.profilePath,
+                                                   preferredRemoteIP: state.serverIP,
+                                                   resolveDNS: false)
+        guard !remoteIPs.isEmpty else {
+            return true
+        }
+
+        return !entries.contains { entry in
+            guard let destination = normalizeHostRouteDestination(entry.destination) else {
+                return false
+            }
+            return remoteIPs.contains(destination)
+        }
+    }
+
+    private func performCleanupAttempt(using state: SessionState,
+                                       errors: inout [Error]) {
+        for route in cleanupIncludedRoutes(using: state) {
+            do {
+                _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
+            } catch {
+                errors.append(error)
+            }
+        }
+
+        do {
+            try removeOpenVPNDefaultRoutes(tunnelName: state.tunName)
+        } catch {
+            errors.append(error)
+        }
+
+        do {
+            _ = try removeRemoteHostRoutes(forProfilePath: state.profilePath,
+                                           preferredRemoteIP: state.serverIP,
+                                           resolveDNS: false)
+        } catch {
+            errors.append(error)
+        }
+
+        do {
+            try restoreDefaultRouteIfNecessary(using: state)
+        } catch {
+            errors.append(error)
+        }
+
+        do {
+            try restoreDNSConfiguration(using: state)
+        } catch {
+            errors.append(error)
+        }
+
+        do {
+            try restorePhysicalIPv6Configuration(using: state)
+        } catch {
+            errors.append(error)
+        }
+
+        do {
+            try removeResolverFiles(using: state)
+        } catch {
+            errors.append(error)
+        }
+
+        do {
+            try flushDNS()
+        } catch {
+            errors.append(error)
+        }
     }
 
     private func restorePhysicalIPv6Configuration(using state: SessionState) throws {
@@ -784,27 +938,45 @@ struct RouteManager {
         return nil
     }
 
-    private func activeDefaultResolverUsesVPNDNS(using state: SessionState) -> Bool {
+    private func activeDefaultResolverLeakState(using state: SessionState) -> ActiveDefaultResolverLeakState {
         guard let output = try? Shell.run("/usr/sbin/scutil", arguments: ["--dns"], allowNonZero: true).stdout else {
-            return false
+            return ActiveDefaultResolverLeakState()
         }
 
         let vpnNameServers = Set(resolverNameServers(for: state))
         let vpnDomains = Set(cleanupResolverDomains(using: state))
         guard !vpnNameServers.isEmpty || !vpnDomains.isEmpty else {
-            return false
+            return ActiveDefaultResolverLeakState()
         }
 
+        var leakState = ActiveDefaultResolverLeakState()
         for resolver in parseActiveDNSResolvers(output) where resolver.domain == nil {
             if resolver.nameServers.contains(where: { vpnNameServers.contains($0) }) {
-                return true
+                leakState.usesVPNNameServers = true
             }
             if resolver.searchDomains.contains(where: { vpnDomains.contains($0) }) {
-                return true
+                leakState.overlapsVPNSearchDomains = true
+            }
+            if leakState.usesVPNNameServers, leakState.overlapsVPNSearchDomains {
+                break
             }
         }
 
-        return false
+        return leakState
+    }
+
+    private func waitForActiveDefaultResolverLeakState(using state: SessionState,
+                                                       timeout: TimeInterval = 2.0,
+                                                       pollInterval: useconds_t = 200_000) -> ActiveDefaultResolverLeakState {
+        let deadline = Date().addingTimeInterval(timeout)
+        var latestState = activeDefaultResolverLeakState(using: state)
+
+        while latestState.usesVPNNameServers, Date() < deadline {
+            usleep(pollInterval)
+            latestState = activeDefaultResolverLeakState(using: state)
+        }
+
+        return latestState
     }
 
     private func parseActiveDNSResolvers(_ output: String) -> [ActiveDNSResolver] {
@@ -938,6 +1110,40 @@ struct RouteManager {
         }
 
         return true
+    }
+
+    private func installSplitDefaultRoutes(gateway: String) throws {
+        _ = try Shell.run("/sbin/route",
+                          arguments: ["-n", "add", "-net", "0.0.0.0/1", gateway],
+                          allowNonZero: true,
+                          requirePrivileges: true)
+        _ = try Shell.run("/sbin/route",
+                          arguments: ["-n", "add", "-net", "128.0.0.0/1", gateway],
+                          allowNonZero: true,
+                          requirePrivileges: true)
+    }
+
+    private func installFailClosedTunnelDefaultRoutes(tunnelName: String) throws {
+        _ = try Shell.run("/sbin/route",
+                          arguments: ["-n", "add", "-net", "0.0.0.0/1", "-interface", tunnelName],
+                          allowNonZero: true,
+                          requirePrivileges: true)
+        _ = try Shell.run("/sbin/route",
+                          arguments: ["-n", "add", "-net", "128.0.0.0/1", "-interface", tunnelName],
+                          allowNonZero: true,
+                          requirePrivileges: true)
+    }
+
+    private func installSplitTunnelRouting(using state: SessionState,
+                                           gateway: String,
+                                           tunnelName: String) throws {
+        try installSplitDefaultRoutes(gateway: gateway)
+        for route in cleanupIncludedRoutes(using: state) {
+            _ = try Shell.run("/sbin/route",
+                              arguments: ["-n", "add", "-net", route, "-interface", tunnelName],
+                              allowNonZero: true,
+                              requirePrivileges: true)
+        }
     }
 
     private func resolvedFullTunnelDefaultRoutes(from capturedRoutes: [ManagedIPv4Route],

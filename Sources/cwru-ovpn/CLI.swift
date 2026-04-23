@@ -19,7 +19,7 @@ enum CLICommand {
 #if CWRU_OVPN_INCLUDE_SELF_TEST
     case selfTest
 #endif
-    case cleanupWatchdog(parentPID: Int32)
+    case cleanupWatchdog(parentPID: Int32, parentStartTime: ProcessStartTime?)
     case help
 }
 
@@ -199,6 +199,8 @@ enum CLI {
 
         if command == "cleanup-watchdog" {
             var parentPID: Int32?
+            var parentStartSeconds: UInt64?
+            var parentStartMicroseconds: UInt64?
             while index < arguments.count {
                 let argument = arguments[index]
                 switch argument {
@@ -213,6 +215,26 @@ enum CLI {
                     }
                     parentPID = parsed
                     index += 2
+                case "--parent-start-seconds":
+                    let nextIndex = index + 1
+                    guard nextIndex < arguments.count else {
+                        throw CLIError.missingValue(argument)
+                    }
+                    guard let parsed = UInt64(arguments[nextIndex]) else {
+                        throw CLIError.unexpectedArgument(arguments[nextIndex])
+                    }
+                    parentStartSeconds = parsed
+                    index += 2
+                case "--parent-start-microseconds":
+                    let nextIndex = index + 1
+                    guard nextIndex < arguments.count else {
+                        throw CLIError.missingValue(argument)
+                    }
+                    guard let parsed = UInt64(arguments[nextIndex]) else {
+                        throw CLIError.unexpectedArgument(arguments[nextIndex])
+                    }
+                    parentStartMicroseconds = parsed
+                    index += 2
                 default:
                     throw CLIError.unexpectedArgument(argument)
                 }
@@ -220,7 +242,16 @@ enum CLI {
             guard let parentPID else {
                 throw CLIError.missingValue("--parent-pid")
             }
-            return .cleanupWatchdog(parentPID: parentPID)
+            let parentStartTime: ProcessStartTime?
+            switch (parentStartSeconds, parentStartMicroseconds) {
+            case (nil, nil):
+                parentStartTime = nil
+            case let (seconds?, microseconds?):
+                parentStartTime = ProcessStartTime(seconds: seconds, microseconds: microseconds)
+            default:
+                throw CLIError.missingValue(parentStartSeconds == nil ? "--parent-start-seconds" : "--parent-start-microseconds")
+            }
+            return .cleanupWatchdog(parentPID: parentPID, parentStartTime: parentStartTime)
         }
 
         if command != "connect" {

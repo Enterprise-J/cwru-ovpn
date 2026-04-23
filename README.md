@@ -2,8 +2,8 @@
 
 Native macOS client for Case Western Reserve University OpenVPN profiles, built on OpenVPN 3.
 
-- **Version:** 0.3.0
-- **Last Updated:** 2026-04-21
+- **Version:** 0.4.0
+- **Last Updated:** 2026-04-23
 - **Requires:** Apple Silicon Macs with macOS 14 or later
 
 ## Features

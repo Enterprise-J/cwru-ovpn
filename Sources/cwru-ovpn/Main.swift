@@ -35,9 +35,7 @@ private enum DetachedConnectLauncher {
             return
         }
 
-        let executablePath = URL(fileURLWithPath: CommandLine.arguments[0])
-            .resolvingSymlinksInPath()
-            .standardized.path
+        let executablePath = try ExecutionIdentity.currentExecutablePath()
         let startupStatusFile = try RuntimePaths.createTemporaryFile(prefix: "startup-status")
         defer { try? FileManager.default.removeItem(at: startupStatusFile) }
 
@@ -231,8 +229,8 @@ enum CWRUOVPNMain {
             case .selfTest:
                 try SelfTest.run()
 #endif
-            case .cleanupWatchdog(let parentPID):
-                CleanupWatchdog.run(parentPID: parentPID)
+            case .cleanupWatchdog(let parentPID, let parentStartTime):
+                CleanupWatchdog.run(parentPID: parentPID, parentStartTime: parentStartTime)
             case .help:
                 CLI.printHelp()
             }

@@ -6,6 +6,20 @@ struct ProcessStartTime: Codable, Equatable {
     let microseconds: UInt64
 }
 
+func processStartTimeMatches(actualStartTime: ProcessStartTime?,
+                             expectedStartTime: ProcessStartTime?) -> Bool {
+    guard let expectedStartTime else {
+        return true
+    }
+
+    // Treat an unreadable start time as inconclusive instead of tearing down a live session.
+    guard let actualStartTime else {
+        return true
+    }
+
+    return actualStartTime == expectedStartTime
+}
+
 func processExists(_ pid: Int32) -> Bool {
     guard pid > 0 else {
         return false
@@ -14,6 +28,15 @@ func processExists(_ pid: Int32) -> Bool {
         return true
     }
     return errno == EPERM
+}
+
+func processExists(_ pid: Int32, expectedStartTime: ProcessStartTime?) -> Bool {
+    guard processExists(pid) else {
+        return false
+    }
+
+    return processStartTimeMatches(actualStartTime: processStartTime(pid),
+                                   expectedStartTime: expectedStartTime)
 }
 
 func processStartTime(_ pid: Int32) -> ProcessStartTime? {
@@ -40,25 +63,12 @@ func processExecutablePath(_ pid: Int32) -> String? {
     if copied > 0 {
         let length = pathBuffer.firstIndex(of: 0) ?? Int(copied)
         let resolved = String(decoding: pathBuffer[..<length], as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         if resolved.hasPrefix("/") {
             return resolved
         }
     }
 
-    guard let result = try? Shell.run("/bin/ps",
-                                      arguments: ["-p", String(pid), "-o", "comm="],
-                                      allowNonZero: true),
-          result.exitCode == 0 else {
-        return nil
-    }
-
-    let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !output.isEmpty else {
-        return nil
-    }
-
-    return output.hasPrefix("/") ? output : nil
+    return nil
 }
 
 func processMatchesExecutable(_ pid: Int32,

@@ -53,8 +53,6 @@ enum ReachabilityProbe {
                 semaphore.signal()
             case .failed(_), .cancelled:
                 semaphore.signal()
-            case .waiting(_):
-                semaphore.signal()
             default:
                 break
             }

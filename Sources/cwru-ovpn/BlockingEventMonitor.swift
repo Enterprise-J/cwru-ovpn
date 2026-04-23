@@ -7,7 +7,6 @@ final class BlockingEventMonitor {
     private let semaphore = DispatchSemaphore(value: 0)
     private var fileSources: [DispatchSourceFileSystemObject] = []
     private var processSources: [DispatchSourceProcess] = []
-    private var fileSourceCancelGroups: [DispatchGroup] = []
 
     init(directoryURLs: [URL], processIDs: [Int32] = []) {
         let directoryPaths = Set(
@@ -35,10 +34,6 @@ final class BlockingEventMonitor {
         for source in fileSources {
             source.cancel()
         }
-
-        for group in fileSourceCancelGroups {
-            group.wait()
-        }
     }
 
     func wait(until deadline: DispatchTime) -> DispatchTimeoutResult {
@@ -54,19 +49,15 @@ final class BlockingEventMonitor {
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd,
                                                                eventMask: [.write, .rename, .delete, .extend],
                                                                queue: queue)
-        let cancelGroup = DispatchGroup()
-        cancelGroup.enter()
         source.setEventHandler { [semaphore] in
             semaphore.signal()
         }
         source.setCancelHandler {
             close(fd)
-            cancelGroup.leave()
         }
         source.resume()
 
         fileSources.append(source)
-        fileSourceCancelGroups.append(cancelGroup)
     }
 
     private func addProcessSource(pid: Int32) {

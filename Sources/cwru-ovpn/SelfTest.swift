@@ -35,10 +35,14 @@ enum SelfTest {
         try testPhysicalDNSCapture()
         try testMockedSplitTunnelFlow()
         try testSplitTunnelRejectsLeakyDefaultDNS()
+        try testSplitTunnelAllowsSupplementalDefaultSearchDomains()
         try testMockedFullTunnelModeSwitch()
         try testMockedFullTunnelDNSFallsBackToPushedResolvers()
+        try testFullTunnelIPv6SafetyFailureThrows()
         try testModeSwitchWaitState()
+        try testProcessStartTimeMatching()
         try testSessionStateSavePreservesPendingModeSwitch()
+        try testURLRedaction()
         try testPlainTopLevelErrorOutput()
         try testMockedStaleStateRecovery()
         try testStaleCleanupWithoutConfigFile()
@@ -299,9 +303,11 @@ enum SelfTest {
         }
 
         switch try CLI.parse(arguments: ["cleanup-watchdog", "--parent-pid", "42"]) {
-        case .cleanupWatchdog(let parentPID):
+        case .cleanupWatchdog(let parentPID, let parentStartTime):
             try expect(parentPID == 42,
                        "cleanup-watchdog should accept internal parent PIDs greater than 1.")
+            try expect(parentStartTime == nil,
+                       "cleanup-watchdog should not require a start-time tuple.")
         default:
             throw SelfTestError.failed("cleanup-watchdog should parse as the internal helper command.")
         }
@@ -330,29 +336,29 @@ enum SelfTest {
     }
 
     private static func testGeneratedSudoers() throws {
-        let username = "codex"
+        let userID: uid_t = 501
         let executablePath = "/bin/ls"
         let executableDigest = try Setup.executableSHA256(at: executablePath)
-        let sudoers = Setup.renderSudoers(username: username,
+        let sudoers = Setup.renderSudoers(userID: userID,
                                           executablePath: executablePath,
                                           executableDigest: executableDigest)
 
         let lines = sudoers.split(separator: "\n").map(String.init)
         try expect(lines.count == 22,
                    "Generated sudoers should cover the standard connect combinations plus disconnect (plain, -f, and --force) and plain setup.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) connect --allow-sleep"),
+        try expect(sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) connect --allow-sleep"),
                    "Generated sudoers should include the allow-sleep connect variant.")
-        try expect(!lines.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) connect --foreground"),
+        try expect(!lines.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) connect --foreground"),
                    "Generated sudoers should not grant passwordless connect --foreground without the matching debug flag.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect"),
+        try expect(sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect"),
                    "Generated sudoers should allow disconnect without requiring a config flag.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect -f"),
+        try expect(sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect -f"),
                    "Generated sudoers should allow disconnect -f for shell-friendly force disconnects.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect --force"),
+        try expect(sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect --force"),
                    "Generated sudoers should allow disconnect --force for stuck sessions.")
-        try expect(sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) setup"),
+        try expect(sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) setup"),
                    "Generated sudoers should allow plain setup.")
-        try expect(!sudoers.contains("\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) status"),
+        try expect(!sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) status"),
                    "Generated sudoers should not grant passwordless access to status.")
         try expect(!sudoers.contains("--config"),
                    "Generated sudoers should not depend on a config path.")
@@ -383,8 +389,9 @@ enum SelfTest {
         let currentStartTime = processStartTime(getpid())
         try expect(currentStartTime != nil,
                    "Current-process start times should be readable for PID validation.")
+        let currentExecutablePath = try ExecutionIdentity.currentExecutablePath()
         try expect(processMatchesExecutable(getpid(),
-                                           expectedExecutablePath: CommandLine.arguments[0],
+                                           expectedExecutablePath: currentExecutablePath,
                                            expectedStartTime: currentStartTime),
                    "PID validation should accept the current process when the executable path and start time both match.")
         try withEnvironmentVariable("SUDO_USER", value: "root") {
@@ -693,6 +700,55 @@ enum SelfTest {
         }
     }
 
+    private static func testSplitTunnelAllowsSupplementalDefaultSearchDomains() throws {
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-search-domain-overlap")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        var session = makeSessionState(
+            pid: 1006,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        session.pushedDNSServers = ["129.22.4.32"]
+        session.pushedSearchDomains = ["case.edu"]
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    activeDefaultDNSServers: ["1.1.1.1"],
+                                    activeDefaultSearchDomains: ["case.edu"],
+                                    tunnelInterfaces: ["utun7"],
+                                    dnsCacheFlushAppliesDNSConfiguration: false)
+
+        try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+            try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                try RouteManager(configuration: configuration).applySplitTunnel(using: &session)
+            }
+
+            try expect(session.routesApplied,
+                       "Split tunnel should stay connected when only supplemental search domains remain on the default resolver.")
+        }
+    }
+
     private static func testMockedFullTunnelModeSwitch() throws {
         let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-full")
         defer { try? FileManager.default.removeItem(at: resolverDirectory) }
@@ -825,6 +881,46 @@ enum SelfTest {
         }
     }
 
+    private static func testFullTunnelIPv6SafetyFailureThrows() throws {
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        let session = makeSessionState(
+            pid: 1007,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .full,
+            cleanupNeeded: true
+        )
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    tunnelInterfaces: ["utun7"])
+
+        do {
+            try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                try RouteManager(configuration: configuration).applyFullTunnelSafety(using: session)
+            }
+            throw SelfTestError.failed("Full tunnel should fail closed when public IPv6 still routes over the physical interface.")
+        } catch RouteManagerError.failedToRestoreFullTunnelIPv6Routes {
+        }
+    }
+
     private static func testModeSwitchWaitState() throws {
         var failedSession = makeSessionState(
             pid: 1004,
@@ -866,6 +962,22 @@ enum SelfTest {
         default:
             throw SelfTestError.failed("Mode switch waits should finish once the persisted session reaches the target mode.")
         }
+    }
+
+    private static func testProcessStartTimeMatching() throws {
+        let expectedStartTime = ProcessStartTime(seconds: 123, microseconds: 456)
+
+        try expect(processStartTimeMatches(actualStartTime: nil,
+                                           expectedStartTime: expectedStartTime),
+                   "Process liveness checks should treat an unreadable start time as inconclusive instead of assuming the process exited.")
+
+        try expect(processStartTimeMatches(actualStartTime: expectedStartTime,
+                                           expectedStartTime: expectedStartTime),
+                   "Matching start times should validate the same process instance.")
+
+        try expect(!processStartTimeMatches(actualStartTime: ProcessStartTime(seconds: 123, microseconds: 789),
+                                            expectedStartTime: expectedStartTime),
+                   "Mismatched start times should still detect PID reuse.")
     }
 
     private static func testSessionStateSavePreservesPendingModeSwitch() throws {
@@ -911,6 +1023,12 @@ enum SelfTest {
         let rendered = renderUserFacingError(SelfTestError.failed("Browser sign-in was cancelled."))
         try expect(rendered == "Browser sign-in was cancelled.\n",
                    "Top-level error output should preserve the plain user-facing message.")
+    }
+
+    private static func testURLRedaction() throws {
+        let rendered = redactSensitiveText("Open https://login.example/callback#token=secret?state=abc now")
+        try expect(rendered == "Open https://login.example/callback#[redacted] now",
+                   "URL redaction should redact fragments that appear before query markers.")
     }
 
     private static func testMockedStaleStateRecovery() throws {
@@ -1079,7 +1197,8 @@ enum SelfTest {
                 session.phase = .disconnecting
                 try session.save()
 
-                CleanupWatchdog.performCleanup(parentPID: session.pid)
+                CleanupWatchdog.performCleanup(parentPID: session.pid,
+                                               parentStartTime: session.processStartTime)
 
                 let reloaded = SessionState.load()
                 try expect(reloaded?.phase == .failed,

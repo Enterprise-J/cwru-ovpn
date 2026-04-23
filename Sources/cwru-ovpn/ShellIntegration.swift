@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 enum ShellIntegration {
@@ -9,8 +10,9 @@ enum ShellIntegration {
     }
 
     static func install(preferredShellPath: String?, legacySourcePaths: [String]) throws -> URL {
+        _ = try ExecutionIdentity.validatedSudoUserIfAvailable()
         let targetURL = preferredRCFile(preferredShellPath: preferredShellPath)
-        let current = (try? String(contentsOf: targetURL, encoding: .utf8)) ?? ""
+        let current = try readRCFileIfPresent(at: targetURL)
         let updated = installBlock(into: current,
                                    helperPath: installedHelperURL.path,
                                    legacySourcePaths: legacySourcePaths)
@@ -21,11 +23,12 @@ enum ShellIntegration {
     }
 
     static func remove() throws -> [URL] {
+        _ = try ExecutionIdentity.validatedSudoUserIfAvailable()
         let helperPath = installedHelperURL.path
         var updatedFiles: [URL] = []
 
         for candidate in knownRCFiles() where FileManager.default.fileExists(atPath: candidate.path) {
-            let current = (try? String(contentsOf: candidate, encoding: .utf8)) ?? ""
+            let current = try readRCFileIfPresent(at: candidate)
             let updated = removeBlock(from: current, helperPaths: [helperPath])
             if updated != current {
                 try write(updated, to: candidate, defaultPermissions: 0o644)
@@ -102,24 +105,35 @@ enum ShellIntegration {
     private static func stripManagedBlock(from content: String) -> String {
         let lines = content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var result: [String] = []
-        var skipping = false
+        var index = 0
 
-        for line in lines {
+        while index < lines.count {
+            let line = lines[index]
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+
             if trimmed == startMarker {
-                skipping = true
-                continue
-            }
-            if skipping {
-                if trimmed == endMarker {
-                    skipping = false
+                guard let endIndex = lines[(index + 1)...].firstIndex(where: {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines) == endMarker
+                }) else {
+                    return content
                 }
+                index = endIndex + 1
                 continue
             }
+
             result.append(line)
+            index += 1
         }
 
         return result.joined(separator: "\n")
+    }
+
+    private static func readRCFileIfPresent(at url: URL) throws -> String {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return ""
+        }
+
+        return try String(contentsOf: url, encoding: .utf8)
     }
 
     private static func preferredRCFile(preferredShellPath: String?) -> URL {
@@ -157,23 +171,29 @@ enum ShellIntegration {
         let fileManager = FileManager.default
         let existingAttributes = try? fileManager.attributesOfItem(atPath: url.path)
         let permissions = (existingAttributes?[.posixPermissions] as? NSNumber)?.intValue ?? defaultPermissions
+        let directoryURL = url.deletingLastPathComponent()
+        let tempURL = directoryURL.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
 
-        try content.write(to: url, atomically: true, encoding: .utf8)
+        try content.write(to: tempURL, atomically: false, encoding: .utf8)
 
         var attributes: [FileAttributeKey: Any] = [
             .posixPermissions: permissions,
         ]
 
-        if getuid() == 0 {
-            let environment = ProcessInfo.processInfo.environment
-            if let uid = environment["SUDO_UID"].flatMap(Int.init) {
-                attributes[.ownerAccountID] = uid
-            }
-            if let gid = environment["SUDO_GID"].flatMap(Int.init) {
-                attributes[.groupOwnerAccountID] = gid
-            }
+        if let sudoIdentity = try ExecutionIdentity.validatedSudoUserIfAvailable() {
+            attributes[.ownerAccountID] = Int(sudoIdentity.userID)
+            attributes[.groupOwnerAccountID] = Int(sudoIdentity.groupID)
         }
 
-        try fileManager.setAttributes(attributes, ofItemAtPath: url.path)
+        do {
+            try fileManager.setAttributes(attributes, ofItemAtPath: tempURL.path)
+            guard rename(tempURL.path, url.path) == 0 else {
+                let renameError = errno
+                throw POSIXError(POSIXErrorCode(rawValue: renameError) ?? .EIO)
+            }
+        } catch {
+            try? fileManager.removeItem(at: tempURL)
+            throw error
+        }
     }
 }

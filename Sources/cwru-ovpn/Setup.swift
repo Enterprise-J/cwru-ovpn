@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 enum SetupError: LocalizedError {
@@ -20,13 +21,8 @@ enum SetupError: LocalizedError {
 
 enum Setup {
     static func installSudoers(profileSourcePath: String?) throws {
-        let sourceExecutablePath = URL(fileURLWithPath: CommandLine.arguments[0])
-            .resolvingSymlinksInPath()
-            .standardized.path
-        let environment = ProcessInfo.processInfo.environment
-        let username = environment["SUDO_USER"].flatMap { $0.isEmpty ? nil : $0 } ?? NSUserName()
-
-        try assertSafeForSudoersUser(username)
+        let targetUser = try ExecutionIdentity.currentUser()
+        let sourceExecutablePath = try ExecutionIdentity.currentExecutablePath()
 
         try ensureHomeStateDirectory()
         if let profileSourcePath {
@@ -41,7 +37,7 @@ enum Setup {
         try assertSafeForSudoers(path: installedExecutablePath, label: "Executable path")
         let installedExecutableDigest = try executableSHA256(at: installedExecutablePath)
 
-        let sudoersBody = renderSudoers(username: username,
+        let sudoersBody = renderSudoers(userID: targetUser.userID,
                                         executablePath: installedExecutablePath,
                                         executableDigest: installedExecutableDigest)
 
@@ -72,13 +68,6 @@ enum Setup {
 
     static func uninstall(purge: Bool) throws {
         let sudoersPath = "/etc/sudoers.d/cwru-ovpn"
-        if FileManager.default.fileExists(atPath: sudoersPath) {
-            _ = try Shell.run("/bin/rm", arguments: [sudoersPath], requirePrivileges: true)
-            print("Removed sudoers rule at \(sudoersPath).")
-        } else {
-            print("No sudoers rule found at \(sudoersPath) — nothing to remove.")
-        }
-
         let privilegedExecutablePath = RuntimePaths.privilegedExecutable.path
         if FileManager.default.fileExists(atPath: privilegedExecutablePath) {
             _ = try Shell.run("/bin/rm", arguments: ["-f", privilegedExecutablePath], requirePrivileges: true)
@@ -123,13 +112,28 @@ enum Setup {
         } else {
             print("Left \(RuntimePaths.homeStateDirectory.path) in place. Re-run uninstall --purge to remove profiles, configs, and logs.")
         }
+
+        if FileManager.default.fileExists(atPath: sudoersPath) {
+            _ = try Shell.run("/bin/rm", arguments: [sudoersPath], requirePrivileges: true)
+            print("Removed sudoers rule at \(sudoersPath).")
+        } else {
+            print("No sudoers rule found at \(sudoersPath) — nothing to remove.")
+        }
     }
 
-    static func renderSudoers(username: String,
+    static func renderSudoers(userID: uid_t,
                               executablePath: String,
                               executableDigest: String) -> String {
+        renderSudoers(userSpecifier: "#\(userID)",
+                      executablePath: executablePath,
+                      executableDigest: executableDigest)
+    }
+
+    private static func renderSudoers(userSpecifier: String,
+                                      executablePath: String,
+                                      executableDigest: String) -> String {
         permittedInvocations(executablePath: executablePath)
-            .map { "\(username) ALL=(root) NOPASSWD: sha256:\(executableDigest) \($0.joined(separator: " "))" }
+            .map { "\(userSpecifier) ALL=(root) NOPASSWD: sha256:\(executableDigest) \($0.joined(separator: " "))" }
             .joined(separator: "\n")
     }
 
@@ -246,17 +250,6 @@ enum Setup {
     }
 
     private static let sudoersPathAllowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+")
-    private static let sudoersUserAllowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-
-    private static func assertSafeForSudoersUser(_ username: String) throws {
-        guard !username.isEmpty,
-              !username.hasPrefix("-"),
-              username.unicodeScalars.allSatisfy({ sudoersUserAllowedCharacters.contains($0) }) else {
-            throw SetupError.unsafePath(
-                "Username contains unsupported characters for sudoers rules: \(username)"
-            )
-        }
-    }
 
     private static func assertSafeForSudoers(path: String, label: String) throws {
         guard !path.isEmpty, path.hasPrefix("/") else {

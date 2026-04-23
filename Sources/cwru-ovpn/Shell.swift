@@ -100,30 +100,38 @@ enum Shell {
 #endif
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: requirePrivileges && getuid() != 0 ? "/usr/bin/sudo" : launchPath)
-        process.arguments = requirePrivileges && getuid() != 0 ? [launchPath] + arguments : arguments
+        process.executableURL = URL(fileURLWithPath: requirePrivileges && geteuid() != 0 ? "/usr/bin/sudo" : launchPath)
+        process.arguments = requirePrivileges && geteuid() != 0 ? [launchPath] + arguments : arguments
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-
-        if let input {
-            let inputPipe = Pipe()
-            process.standardInput = inputPipe
-            try process.run()
-            inputPipe.fileHandleForWriting.write(input)
-            inputPipe.fileHandleForWriting.closeFile()
-        } else {
-            try process.run()
-        }
-
-        // Drain both pipes before waitUntilExit() so large child output cannot deadlock the parent.
         let stdoutCollector = PipeCollector(handle: stdoutPipe.fileHandleForReading)
         let stderrCollector = PipeCollector(handle: stderrPipe.fileHandleForReading)
+
+        let inputWriteCompletion = DispatchGroup()
+        var inputPipe: Pipe?
+        if input != nil {
+            inputPipe = Pipe()
+            process.standardInput = inputPipe
+        }
+
+        try process.run()
+
+        // Drain both pipes before waitUntilExit() so large child output cannot deadlock the parent.
         stdoutCollector.start()
         stderrCollector.start()
+        if let input, let inputPipe {
+            inputWriteCompletion.enter()
+            DispatchQueue.global().async {
+                inputPipe.fileHandleForWriting.write(input)
+                inputPipe.fileHandleForWriting.closeFile()
+                inputWriteCompletion.leave()
+            }
+        }
         process.waitUntilExit()
+        inputWriteCompletion.wait()
         let stdoutData = stdoutCollector.finish()
         let stderrData = stderrCollector.finish()
 

@@ -96,8 +96,16 @@ class BridgeClient final : public OpenVPNClient
     void stop_and_join()
     {
         OpenVPNClient::stop();
-        if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id())
-            worker_.join();
+
+        std::thread worker;
+        {
+            std::scoped_lock lock(mutex_);
+            if (!worker_.joinable() || worker_.get_id() == std::this_thread::get_id())
+                return;
+            worker = std::move(worker_);
+        }
+
+        worker.join();
     }
 
     char *copy_tun_name() const

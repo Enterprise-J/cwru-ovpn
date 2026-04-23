@@ -180,7 +180,7 @@ final class VPNController: NSObject {
         self.startupStatusFilePath = startupStatusFilePath.map { URL(fileURLWithPath: $0).standardized.path }
         self.sessionState = SessionState(
             pid: getpid(),
-            executablePath: Self.currentExecutablePath,
+            executablePath: try Self.currentExecutablePath(),
             processStartTime: processStartTime(getpid()),
             phase: .connecting,
             profilePath: self.profilePath,
@@ -273,7 +273,7 @@ final class VPNController: NSObject {
             throw VPNControllerError.missingSession
         }
 
-        let expectedExecutablePath = session.executablePath ?? currentExecutablePath
+        let expectedExecutablePath = try session.executablePath ?? currentExecutablePath()
 
         if processExists(session.pid) {
             guard try signalValidatedProcess(pid: session.pid,
@@ -329,7 +329,7 @@ final class VPNController: NSObject {
             return false
         }
 
-        let expectedExecutablePath = session.executablePath ?? currentExecutablePath
+        let expectedExecutablePath = try session.executablePath ?? currentExecutablePath()
         if !processExists(session.pid) {
             if session.cleanupNeeded {
                 print("Recovering stale network state from the previous session before reconnecting.")
@@ -479,10 +479,8 @@ final class VPNController: NSObject {
         return .pending(updatedSawRequestedMode: sawRequestedMode)
     }
 
-    private static var currentExecutablePath: String {
-        URL(fileURLWithPath: CommandLine.arguments[0])
-            .resolvingSymlinksInPath()
-            .standardized.path
+    private static func currentExecutablePath() throws -> String {
+        try ExecutionIdentity.currentExecutablePath()
     }
 
     static func validateSessionForPrivilegedCleanup(_ session: SessionState) throws {
@@ -740,6 +738,8 @@ final class VPNController: NSObject {
             do {
                 try handleConnected()
             } catch {
+                EventLog.append(note: "Post-connect configuration failed: \(error.localizedDescription)",
+                                phase: sessionState.phase)
                 emit("The \(tunnelMode.modeDescription) configuration could not be completed: \(error.localizedDescription)", level: .error)
                 requestStop()
             }
@@ -837,13 +837,7 @@ final class VPNController: NSObject {
                 throw error
             }
         } else {
-            do {
-                try routeManager.applyFullTunnelSafety(using: connectedState)
-            } catch {
-                EventLog.append(note: "Full-tunnel IPv6 safety adjustment failed: \(error.localizedDescription)",
-                                phase: sessionState.phase)
-                emit("Full-tunnel IPv6 safety adjustment failed: \(error.localizedDescription)", level: .debug)
-            }
+            try routeManager.applyFullTunnelSafety(using: connectedState)
         }
 
         guard !cleanupComplete, !requestedStop else {
@@ -1363,7 +1357,7 @@ final class VPNController: NSObject {
 
         try RuntimePaths.ensureSessionStateDirectory()
         let lockFile = RuntimePaths.sessionStateDirectory.appendingPathComponent("controller.lock")
-        let fd = open(lockFile.path, O_CREAT | O_RDWR, mode_t(S_IRUSR | S_IWUSR))
+        let fd = open(lockFile.path, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
         guard fd >= 0 else {
             throw VPNControllerError.failedToStart("Failed to open the controller lock file.")
         }
@@ -1397,13 +1391,17 @@ final class VPNController: NSObject {
 
     private func startCleanupWatchdog() {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: Self.currentExecutablePath)
-        process.arguments = ["cleanup-watchdog", "--parent-pid", String(getpid())]
-        process.standardInput = FileHandle(forReadingAtPath: "/dev/null")
-        process.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
-        process.standardError = FileHandle(forWritingAtPath: "/dev/null")
-
         do {
+            process.executableURL = URL(fileURLWithPath: try Self.currentExecutablePath())
+            var arguments = ["cleanup-watchdog", "--parent-pid", String(getpid())]
+            if let startTime = sessionState.processStartTime {
+                arguments += ["--parent-start-seconds", String(startTime.seconds),
+                              "--parent-start-microseconds", String(startTime.microseconds)]
+            }
+            process.arguments = arguments
+            process.standardInput = FileHandle(forReadingAtPath: "/dev/null")
+            process.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
+            process.standardError = FileHandle(forWritingAtPath: "/dev/null")
             try process.run()
         } catch {
             EventLog.append(note: "Failed to start cleanup watchdog: \(error.localizedDescription)",
@@ -1457,24 +1455,23 @@ final class VPNController: NSObject {
 
     private func spawnManagedReconnect(_ request: ManagedReconnectRequest) {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: Self.currentExecutablePath)
-
-        var arguments = ["connect"]
-        if let configFilePath = request.configFilePath {
-            arguments += ["--config", configFilePath]
-        }
-        arguments += ["--mode", request.tunnelMode.rawValue]
-        if request.allowSleep {
-            arguments.append("--allow-sleep")
-        }
-        arguments.append("--background-child")
-        process.arguments = arguments
-        process.environment = ProcessInfo.processInfo.environment
-        process.standardInput = FileHandle(forReadingAtPath: "/dev/null")
-        process.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
-        process.standardError = FileHandle(forWritingAtPath: "/dev/null")
-
         do {
+            process.executableURL = URL(fileURLWithPath: try Self.currentExecutablePath())
+
+            var arguments = ["connect"]
+            if let configFilePath = request.configFilePath {
+                arguments += ["--config", configFilePath]
+            }
+            arguments += ["--mode", request.tunnelMode.rawValue]
+            if request.allowSleep {
+                arguments.append("--allow-sleep")
+            }
+            arguments.append("--background-child")
+            process.arguments = arguments
+            process.environment = ProcessInfo.processInfo.environment
+            process.standardInput = FileHandle(forReadingAtPath: "/dev/null")
+            process.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
+            process.standardError = FileHandle(forWritingAtPath: "/dev/null")
             try process.run()
             EventLog.append(note: "Started managed reconnect after \(request.reason).",
                             phase: .connecting)
