@@ -17,7 +17,7 @@ enum SelfTestError: LocalizedError {
 enum SelfTest {
     static func run() throws {
         try testReachabilityProbeConfig()
-        try testAllowSleepConfig()
+        try testPreventSleepConfig()
         try testLegacyConfigKeys()
         try testLenientSplitTunnelDecoding()
         try testMissingConfigErrors()
@@ -94,7 +94,7 @@ enum SelfTest {
                    "Reachability probe targets should reject malformed hostnames.")
     }
 
-    private static func testAllowSleepConfig() throws {
+    private static func testPreventSleepConfig() throws {
         let defaultedData = Data(
             """
             {
@@ -108,13 +108,13 @@ enum SelfTest {
         )
 
         let defaultedConfig = try JSONDecoder().decode(AppConfig.self, from: defaultedData)
-        try expect(!defaultedConfig.allowSleep,
-                   "allowSleep should default to false when omitted from config.")
+        try expect(defaultedConfig.preventSleep,
+                   "preventSleep should default to true when omitted from config.")
 
         let enabledData = Data(
             """
             {
-              "allowSleep": true,
+              "preventSleep": true,
               "splitTunnel": {
                 "includedRoutes": [],
                 "resolverDomains": [],
@@ -125,8 +125,25 @@ enum SelfTest {
         )
 
         let enabledConfig = try JSONDecoder().decode(AppConfig.self, from: enabledData)
-        try expect(enabledConfig.allowSleep,
-                   "allowSleep should decode when explicitly enabled in config.")
+        try expect(enabledConfig.preventSleep,
+                   "preventSleep should decode when explicitly enabled in config.")
+
+        let disabledData = Data(
+            """
+            {
+              "preventSleep": false,
+              "splitTunnel": {
+                "includedRoutes": [],
+                "resolverDomains": [],
+                "resolverNameServers": []
+              }
+            }
+            """.utf8
+        )
+
+        let disabledConfig = try JSONDecoder().decode(AppConfig.self, from: disabledData)
+        try expect(!disabledConfig.preventSleep,
+                   "preventSleep false should allow system sleep.")
     }
 
     private static func testLegacyConfigKeys() throws {
@@ -134,7 +151,6 @@ enum SelfTest {
             """
             {
               "defaultProfilePath": "~/.cwru-ovpn/profile.ovpn",
-              "allowIdleSleep": false,
               "splitTunnel": {
                 "includedRoutes": [],
                 "resolverDomains": [],
@@ -147,8 +163,6 @@ enum SelfTest {
         let legacyConfig = try JSONDecoder().decode(AppConfig.self, from: legacyData)
         try expect(legacyConfig.profilePath == "~/.cwru-ovpn/profile.ovpn",
                    "Legacy defaultProfilePath should still decode.")
-        try expect(!legacyConfig.allowSleep,
-                   "Legacy allowIdleSleep should still decode.")
     }
 
     private static func testLenientSplitTunnelDecoding() throws {
@@ -230,7 +244,7 @@ enum SelfTest {
         switch try CLI.parse(arguments: ["connect", "--allow-sleep"]) {
         case .connect(_, _, _, let allowSleep, let foregroundRequested, let backgroundChild, let startupStatusFilePath):
             try expect(allowSleep,
-                       "connect --allow-sleep should allow idle sleep for this run.")
+                       "connect --allow-sleep should allow system sleep for this run.")
             try expect(!foregroundRequested,
                        "connect --allow-sleep should not force foreground mode.")
             try expect(!backgroundChild,
@@ -1056,7 +1070,7 @@ enum SelfTest {
                 {
                   "profilePath": "\(profileURL.path)",
                   "tunnelMode": "split",
-                  "allowSleep": false,
+                  "preventSleep": true,
                   "verbosity": "daily",
                   "splitTunnel": {
                     "includedRoutes": ["129.22.0.0/16"],
@@ -1170,7 +1184,7 @@ enum SelfTest {
                 {
                   "profilePath": "\(profileURL.path)",
                   "tunnelMode": "split",
-                  "allowSleep": false,
+                  "preventSleep": true,
                   "verbosity": "daily",
                   "splitTunnel": {
                     "includedRoutes": [],

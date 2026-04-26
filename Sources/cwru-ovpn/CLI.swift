@@ -351,7 +351,7 @@ enum CLI {
           --config PATH        Path to the config JSON file
           --verbosity LEVEL    Logging level: silent, daily, debug (default: daily)
           --mode MODE          Tunnel mode: full or split (default from config)
-          --allow-sleep        Allow idle sleep for this run
+          --allow-sleep        Allow system sleep for this run
           --foreground         Keep the controller attached to the terminal
 
         Setup options:

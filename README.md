@@ -2,8 +2,8 @@
 
 Native macOS client for Case Western Reserve University OpenVPN profiles, built on OpenVPN 3.
 
-- **Version:** 0.4.0
-- **Last Updated:** 2026-04-23
+- **Version:** 0.4.1
+- **Last Updated:** 2026-04-25
 - **Requires:** Apple Silicon Macs with macOS 14 or later
 
 ## Features
@@ -36,7 +36,7 @@ For Intel Macs, see [Build](#build).
 | `ovpnstatus` | Print the current connection status |
 | `ovpnd` | Disconnect the current session |
 
-By default, `cwru-ovpn` tries to prevent idle sleep while connected. Pass `--allow-sleep`, or set `allowSleep` to `true` in `config.json`, to let the Mac idle sleep instead.
+By default, `cwru-ovpn` prevents system sleep while connected, including on battery power. Pass `--allow-sleep`, or set `preventSleep` to `false` in `config.json`, to let the Mac sleep instead.
 
 ## Advanced
 
@@ -63,7 +63,7 @@ sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn <command> [that-command'
 | `connect` | `--config PATH` | Use a specific config JSON file |
 | `connect` | `--verbosity silent\|daily\|debug` | Override the configured log level |
 | `connect` | `--mode full\|split` | Override the configured tunnel mode; `--tunnel-mode` is also accepted |
-| `connect` | `--allow-sleep` | Allow the Mac to idle sleep for this run |
+| `connect` | `--allow-sleep` | Allow the Mac to sleep for this run |
 | `connect` | `--foreground` | Keep the controller attached to the terminal |
 | `disconnect` | `--force` or `-f` | Drop stale state even if cleanup still reports the network as unhealthy; `ovpnd` intentionally does not forward this flag |
 | `logs` | `--tail COUNT` | Show the last `COUNT` event log entries; defaults to `40` |
@@ -106,7 +106,7 @@ The config file lives at `~/.cwru-ovpn/config.json`. A template is provided at [
 | --- | --- |
 | `profilePath` | Default `.ovpn` profile path |
 | `tunnelMode` | Default mode (`full` or `split`) |
-| `allowSleep` | `true` to allow idle sleep while connected; defaults to `false` |
+| `preventSleep` | `true` to prevent system sleep while connected; defaults to `true` |
 | `verbosity` | `silent`, `daily`, or `debug` |
 | `splitTunnel.includedRoutes` | IPv4 CIDR blocks routed through the VPN |
 | `splitTunnel.reachabilityProbeHosts` | Public IPs or hostnames probed during health checks; omit for defaults, `[]` to disable |

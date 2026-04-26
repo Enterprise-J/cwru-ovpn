@@ -1,21 +1,36 @@
 import Foundation
-import IOKit.ps
+import IOKit.pwr_mgt
+
+enum PowerManagementError: LocalizedError {
+    case failedToCreateUserIdleSystemSleepAssertion(IOReturn)
+
+    var errorDescription: String? {
+        switch self {
+        case .failedToCreateUserIdleSystemSleepAssertion(let result):
+            return String(format: "Could not create PreventUserIdleSystemSleep assertion (IOReturn 0x%08x).",
+                          UInt32(bitPattern: result))
+        }
+    }
+}
 
 enum PowerManagement {
-    static var isLowPowerModeEnabled: Bool {
-        ProcessInfo.processInfo.isLowPowerModeEnabled
+    typealias AssertionID = IOPMAssertionID
+
+    static func beginPreventUserIdleSystemSleepAssertion(reason: String) throws -> AssertionID {
+        let assertionType = kIOPMAssertPreventUserIdleSystemSleep as CFString
+        var assertionID = AssertionID(0)
+        let result = IOPMAssertionCreateWithName(assertionType,
+                                                 IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                                 reason as CFString,
+                                                 &assertionID)
+        guard result == kIOReturnSuccess else {
+            throw PowerManagementError.failedToCreateUserIdleSystemSleepAssertion(result)
+        }
+
+        return assertionID
     }
 
-    static var isRunningOnBatteryPower: Bool {
-        guard let snapshotRef = IOPSCopyPowerSourcesInfo() else {
-            return false
-        }
-
-        let snapshot = snapshotRef.takeRetainedValue()
-        guard let rawPowerSource = IOPSGetProvidingPowerSourceType(snapshot)?.takeUnretainedValue() else {
-            return false
-        }
-
-        return rawPowerSource as String == kIOPSBatteryPowerValue
+    static func endAssertion(_ assertionID: AssertionID) {
+        _ = IOPMAssertionRelease(assertionID)
     }
 }

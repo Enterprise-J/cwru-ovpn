@@ -200,7 +200,7 @@ struct AppConfig: Codable {
 
     var profilePath: String?
     var tunnelMode: AppTunnelMode
-    var allowSleep: Bool
+    var preventSleep: Bool
     var splitTunnel: SplitTunnelConfiguration
     var verbosity: AppVerbosity
 
@@ -214,7 +214,7 @@ struct AppConfig: Codable {
     static let fallback = AppConfig(
         profilePath: nil,
         tunnelMode: .split,
-        allowSleep: false,
+        preventSleep: true,
         splitTunnel: SplitTunnelConfiguration(
             includedRoutes: [],
             resolverDomains: [],
@@ -310,24 +310,23 @@ struct AppConfig: Codable {
     enum CodingKeys: String, CodingKey {
         case profilePath
         case tunnelMode
-        case allowSleep
+        case preventSleep
         case splitTunnel
         case verbosity
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
         case defaultProfilePath
-        case allowIdleSleep
     }
 
     init(profilePath: String?,
          tunnelMode: AppTunnelMode,
-         allowSleep: Bool,
+         preventSleep: Bool,
          splitTunnel: SplitTunnelConfiguration,
          verbosity: AppVerbosity) {
         self.profilePath = profilePath
         self.tunnelMode = tunnelMode
-        self.allowSleep = allowSleep
+        self.preventSleep = preventSleep
         self.splitTunnel = splitTunnel
         self.verbosity = verbosity
     }
@@ -336,7 +335,7 @@ struct AppConfig: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(profilePath, forKey: .profilePath)
         try container.encode(tunnelMode, forKey: .tunnelMode)
-        try container.encode(allowSleep, forKey: .allowSleep)
+        try container.encode(preventSleep, forKey: .preventSleep)
         try container.encode(splitTunnel, forKey: .splitTunnel)
         try container.encode(verbosity, forKey: .verbosity)
     }
@@ -348,9 +347,7 @@ struct AppConfig: Codable {
         profilePath = try container.decodeIfPresent(String.self, forKey: .profilePath)
             ?? legacyContainer.decodeIfPresent(String.self, forKey: .defaultProfilePath)
         tunnelMode = try container.decodeIfPresent(AppTunnelMode.self, forKey: .tunnelMode) ?? Self.fallback.tunnelMode
-        allowSleep = try container.decodeIfPresent(Bool.self, forKey: .allowSleep)
-            ?? legacyContainer.decodeIfPresent(Bool.self, forKey: .allowIdleSleep)
-            ?? Self.fallback.allowSleep
+        preventSleep = try container.decodeIfPresent(Bool.self, forKey: .preventSleep) ?? Self.fallback.preventSleep
         splitTunnel = try container.decodeIfPresent(SplitTunnelConfiguration.self, forKey: .splitTunnel) ?? Self.fallback.splitTunnel
         verbosity = try container.decodeIfPresent(AppVerbosity.self, forKey: .verbosity) ?? .daily
     }

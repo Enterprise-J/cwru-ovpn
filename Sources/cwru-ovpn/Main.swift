@@ -180,7 +180,7 @@ enum CWRUOVPNMain {
                     }
                     let configuration = try AppConfig.load(explicitConfigPath: configFilePath)
                     let profilePath = try configuration.resolvedProfilePath(explicitConfigPath: configFilePath)
-                    let effectiveAllowSleep = allowSleep || configuration.allowSleep
+                    let effectivePreventSleep = configuration.preventSleep && !allowSleep
                     _ = NSApplication.shared
                     NSApplication.shared.setActivationPolicy(.accessory)
                     let resolvedConfigFilePath = AppConfig.resolvedConfigURL(explicitConfigPath: configFilePath)?.path
@@ -189,7 +189,7 @@ enum CWRUOVPNMain {
                                                        configuration: configuration,
                                                        verbosity: verbosityOverride ?? configuration.verbosity,
                                                        tunnelMode: tunnelModeOverride ?? configuration.tunnelMode,
-                                                       allowSleep: effectiveAllowSleep,
+                                                       preventSleep: effectivePreventSleep,
                                                        backgroundChild: backgroundChild,
                                                        startupStatusFilePath: startupStatusFilePath)
                     RuntimeState.controller = controller

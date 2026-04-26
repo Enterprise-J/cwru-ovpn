@@ -58,7 +58,7 @@ fileprivate final class PathMonitorPayload: NSObject {
 private struct ManagedReconnectRequest {
     let configFilePath: String?
     let tunnelMode: AppTunnelMode
-    let allowSleep: Bool
+    let preventSleep: Bool
     let reason: String
 }
 
@@ -138,7 +138,7 @@ final class VPNController: NSObject {
     private var reachabilityProbeInFlight = false
     private var lastReachabilityProbeHealthy = true
     private var lastReachabilityFailureAt: Date?
-    private var sleepActivityToken: NSObjectProtocol?
+    private var sleepAssertionID: PowerManagement.AssertionID?
     private var externalWebAuthSession: ExternalWebAuthSession?
     private var controllerLockFD: Int32 = -1
     private var cleanupComplete = false
@@ -147,7 +147,7 @@ final class VPNController: NSObject {
     private var managedReconnectRequest: ManagedReconnectRequest?
     private var workspaceObserversInstalled = false
     private var disconnectingAfterWake = false
-    private let allowSleep: Bool
+    private let preventSleep: Bool
     private let backgroundChild: Bool
     private let startupStatusFilePath: String?
     private var exitFailureMessage: String?
@@ -157,7 +157,7 @@ final class VPNController: NSObject {
          configuration: AppConfig,
          verbosity: AppVerbosity,
          tunnelMode: AppTunnelMode,
-         allowSleep: Bool,
+         preventSleep: Bool,
          backgroundChild: Bool = false,
          startupStatusFilePath: String? = nil) throws {
         let routeManager = RouteManager(configuration: configuration.splitTunnel)
@@ -175,7 +175,7 @@ final class VPNController: NSObject {
         self.tunnelMode = tunnelMode
         self.reachabilityProbeHosts = configuration.splitTunnel.effectiveReachabilityProbeHosts
         self.routeManager = routeManager
-        self.allowSleep = allowSleep
+        self.preventSleep = preventSleep
         self.backgroundChild = backgroundChild
         self.startupStatusFilePath = startupStatusFilePath.map { URL(fileURLWithPath: $0).standardized.path }
         self.sessionState = SessionState(
@@ -957,7 +957,7 @@ final class VPNController: NSObject {
 
         managedReconnectRequest = ManagedReconnectRequest(configFilePath: configFilePath,
                                                          tunnelMode: tunnelMode,
-                                                         allowSleep: allowSleep,
+                                                         preventSleep: preventSleep,
                                                          reason: reason)
         EventLog.append(note: "Scheduling managed reconnect after \(reason).", phase: sessionState.phase)
         emit("Reconnecting after \(reason).", level: .error)
@@ -1463,7 +1463,7 @@ final class VPNController: NSObject {
                 arguments += ["--config", configFilePath]
             }
             arguments += ["--mode", request.tunnelMode.rawValue]
-            if request.allowSleep {
+            if !request.preventSleep {
                 arguments.append("--allow-sleep")
             }
             arguments.append("--background-child")
@@ -1638,34 +1638,32 @@ final class VPNController: NSObject {
     }
 
     private func startSleepAssertionIfNeeded() {
-        guard !allowSleep else {
-            EventLog.append(note: "Idle sleep is allowed; skipping the idle-sleep assertion.", phase: sessionState.phase)
+        guard preventSleep else {
+            EventLog.append(note: "System sleep is allowed; skipping the system-sleep assertion.", phase: sessionState.phase)
             return
         }
-        guard sleepActivityToken == nil else {
-            return
-        }
-
-        if PowerManagement.isLowPowerModeEnabled {
-            EventLog.append(note: "Low Power Mode is enabled; allowing idle sleep while VPN is connected.", phase: sessionState.phase)
+        guard sleepAssertionID == nil else {
             return
         }
 
-        if PowerManagement.isRunningOnBatteryPower {
-            EventLog.append(note: "Running on battery power; allowing idle sleep while VPN is connected.", phase: sessionState.phase)
-            return
+        do {
+            sleepAssertionID = try PowerManagement.beginPreventUserIdleSystemSleepAssertion(
+                reason: "Keep CWRU OpenVPN active while connected"
+            )
+            EventLog.append(note: "Preventing user idle system sleep while VPN is connected.",
+                            phase: sessionState.phase)
+        } catch {
+            EventLog.append(note: "Failed to prevent system sleep: \(error.localizedDescription)",
+                            phase: sessionState.phase)
+            emit("Failed to prevent system sleep: \(error.localizedDescription)", level: .error)
         }
-
-        sleepActivityToken = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled],
-                                                                   reason: "Keep CWRU OpenVPN active while connected")
-        EventLog.append(note: "Preventing idle sleep while VPN is connected.", phase: sessionState.phase)
     }
 
     private func stopSleepAssertion() {
-        if let sleepActivityToken {
-            ProcessInfo.processInfo.endActivity(sleepActivityToken)
+        if let sleepAssertionID {
+            PowerManagement.endAssertion(sleepAssertionID)
         }
-        sleepActivityToken = nil
+        sleepAssertionID = nil
     }
 
     @MainActor
