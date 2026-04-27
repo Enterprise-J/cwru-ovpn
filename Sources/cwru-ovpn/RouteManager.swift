@@ -133,16 +133,16 @@ struct RouteManager {
             mutatedNetwork = true
             try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
             for route in cleanupIncludedRoutes(using: state) {
-                _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
+                try deleteIPv4NetRoute(route, allowNonZero: true)
             }
 
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", "0.0.0.0/1", gateway], requirePrivileges: true)
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", "128.0.0.0/1", gateway], requirePrivileges: true)
+            try addIPv4NetRoute("0.0.0.0/1", gateway: gateway, allowNonZero: false)
+            try addIPv4NetRoute("128.0.0.0/1", gateway: gateway, allowNonZero: false)
             for route in cleanupIncludedRoutes(using: state) {
-                _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", route, "-interface", validatedTunnelName], requirePrivileges: true)
+                try addIPv4NetRoute(route, interfaceName: validatedTunnelName, allowNonZero: false)
             }
 
-            try disablePhysicalIPv6ForSplitTunnel(using: state)
+            try disablePhysicalIPv6IfEnabled(using: state)
             try installResolverFiles(using: state)
             try restoreDNSConfiguration(using: state)
             try flushDNS()
@@ -172,7 +172,7 @@ struct RouteManager {
             return
         }
 
-        try disablePhysicalIPv6ForSplitTunnel(using: state)
+        try disablePhysicalIPv6IfEnabled(using: state)
 
         guard try fullTunnelIPv6LooksSafe(tunnelName: validatedTunnelName) else {
             throw RouteManagerError.failedToRestoreFullTunnelIPv6Routes
@@ -189,27 +189,25 @@ struct RouteManager {
 
         do {
             for route in cleanupIncludedRoutes(using: state) {
-                _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
+                try deleteIPv4NetRoute(route, allowNonZero: true)
             }
 
             // Remove split default-route overrides and route all IPv4 traffic via tunnel.
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "0.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "128.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
+            try deleteIPv4NetRoute("0.0.0.0/1", allowNonZero: true)
+            try deleteIPv4NetRoute("128.0.0.0/1", allowNonZero: true)
             splitDefaultsRemoved = true
 
             let routesToRestore = resolvedFullTunnelDefaultRoutes(from: fullTunnelRoutes, tunnelName: validatedTunnelName)
             for route in routesToRestore {
                 switch route.nextHopKind {
                 case .gateway:
-                    _ = try Shell.run("/sbin/route",
-                                      arguments: ["-n", "add", "-net", route.destination, route.nextHopValue],
-                                      allowNonZero: true,
-                                      requirePrivileges: true)
+                    try addIPv4NetRoute(route.destination,
+                                        gateway: route.nextHopValue,
+                                        allowNonZero: true)
                 case .interface:
-                    _ = try Shell.run("/sbin/route",
-                                      arguments: ["-n", "add", "-net", route.destination, "-interface", route.nextHopValue],
-                                      allowNonZero: true,
-                                      requirePrivileges: true)
+                    try addIPv4NetRoute(route.destination,
+                                        interfaceName: route.nextHopValue,
+                                        allowNonZero: true)
                 }
             }
 
@@ -335,8 +333,8 @@ struct RouteManager {
                 try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
                 try installSplitDefaultRoutes(gateway: gateway)
                 for route in cleanupIncludedRoutes(using: state) {
-                    _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
-                    _ = try Shell.run("/sbin/route", arguments: ["-n", "add", "-net", route, "-interface", validatedTunnelName], allowNonZero: true, requirePrivileges: true)
+                    try deleteIPv4NetRoute(route, allowNonZero: true)
+                    try addIPv4NetRoute(route, interfaceName: validatedTunnelName, allowNonZero: true)
                 }
             } catch {
                 try? installSplitTunnelRouting(using: state,
@@ -481,11 +479,11 @@ struct RouteManager {
             validatedTunnelName = nil
         }
 
-        _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "0.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
+        try deleteIPv4NetRoute("0.0.0.0/1", allowNonZero: true)
 
         var firstError: Error?
         do {
-            _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", "128.0.0.0/1"], allowNonZero: true, requirePrivileges: true)
+            try deleteIPv4NetRoute("128.0.0.0/1", allowNonZero: true)
         } catch {
             firstError = error
         }
@@ -530,18 +528,9 @@ struct RouteManager {
             return
         }
 
-        let dnsServers = state.originalDNSServers ?? []
-        let searchDomains = state.originalSearchDomains ?? []
-
-        let dnsArguments = dnsServers.isEmpty ? ["-setdnsservers", serviceName, "empty"] : ["-setdnsservers", serviceName] + dnsServers
-        _ = try Shell.run("/usr/sbin/networksetup",
-                          arguments: dnsArguments,
-                          requirePrivileges: true)
-
-        let searchArguments = searchDomains.isEmpty ? ["-setsearchdomains", serviceName, "empty"] : ["-setsearchdomains", serviceName] + searchDomains
-        _ = try Shell.run("/usr/sbin/networksetup",
-                          arguments: searchArguments,
-                          requirePrivileges: true)
+        try setDNSConfiguration(serviceName: serviceName,
+                                dnsServers: state.originalDNSServers ?? [],
+                                searchDomains: state.originalSearchDomains ?? [])
     }
 
     private func restoreFullTunnelDNS(using state: SessionState) throws {
@@ -558,15 +547,33 @@ struct RouteManager {
                                               state.originalSearchDomains)
             .filter(AppConfig.SplitTunnelConfiguration.isValidDomainName)
 
-        let dnsArguments = dnsServers.isEmpty ? ["-setdnsservers", serviceName, "empty"] : ["-setdnsservers", serviceName] + dnsServers
+        try setDNSConfiguration(serviceName: serviceName,
+                                dnsServers: dnsServers,
+                                searchDomains: searchDomains)
+    }
+
+    private func setDNSConfiguration(serviceName: String,
+                                     dnsServers: [String],
+                                     searchDomains: [String]) throws {
+        let dnsArguments = networkSetupListArguments(command: "-setdnsservers",
+                                                     serviceName: serviceName,
+                                                     values: dnsServers)
         _ = try Shell.run("/usr/sbin/networksetup",
                           arguments: dnsArguments,
                           requirePrivileges: true)
 
-        let searchArguments = searchDomains.isEmpty ? ["-setsearchdomains", serviceName, "empty"] : ["-setsearchdomains", serviceName] + searchDomains
+        let searchArguments = networkSetupListArguments(command: "-setsearchdomains",
+                                                        serviceName: serviceName,
+                                                        values: searchDomains)
         _ = try Shell.run("/usr/sbin/networksetup",
                           arguments: searchArguments,
                           requirePrivileges: true)
+    }
+
+    private func networkSetupListArguments(command: String,
+                                           serviceName: String,
+                                           values: [String]) -> [String] {
+        values.isEmpty ? [command, serviceName, "empty"] : [command, serviceName] + values
     }
 
     @discardableResult
@@ -667,7 +674,7 @@ struct RouteManager {
                                         ipv6Mode: try ipv6Mode(forServiceNamed: serviceName))
     }
 
-    private func disablePhysicalIPv6ForSplitTunnel(using state: SessionState) throws {
+    private func disablePhysicalIPv6IfEnabled(using state: SessionState) throws {
         guard let serviceName = state.physicalServiceName, !serviceName.isEmpty else {
             return
         }
@@ -696,7 +703,7 @@ struct RouteManager {
         if currentMode != "off" {
             EventLog.append(note: "Split-tunnel privacy check re-disabled physical-service IPv6.",
                             phase: state.phase)
-            try disablePhysicalIPv6ForSplitTunnel(using: state)
+            try disablePhysicalIPv6IfEnabled(using: state)
             return true
         }
 
@@ -825,7 +832,7 @@ struct RouteManager {
                                        errors: inout [Error]) {
         for route in cleanupIncludedRoutes(using: state) {
             do {
-                _ = try Shell.run("/sbin/route", arguments: ["-n", "delete", "-net", route], allowNonZero: true, requirePrivileges: true)
+                try deleteIPv4NetRoute(route, allowNonZero: true)
             } catch {
                 errors.append(error)
             }
@@ -998,7 +1005,7 @@ struct RouteManager {
             }
 
             if line.hasPrefix("domain") {
-                if let value = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespacesAndNewlines),
+                if let value = valueAfterColon(in: line),
                    !value.isEmpty {
                     current.domain = value
                 }
@@ -1006,7 +1013,7 @@ struct RouteManager {
             }
 
             if line.hasPrefix("search domain[") {
-                if let value = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespacesAndNewlines),
+                if let value = valueAfterColon(in: line),
                    !value.isEmpty {
                     current.searchDomains.append(value)
                 }
@@ -1014,7 +1021,7 @@ struct RouteManager {
             }
 
             if line.hasPrefix("nameserver[") {
-                if let value = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespacesAndNewlines),
+                if let value = valueAfterColon(in: line),
                    !value.isEmpty {
                     current.nameServers.append(value)
                 }
@@ -1026,6 +1033,12 @@ struct RouteManager {
         }
 
         return resolvers
+    }
+
+    private func valueAfterColon(in line: String) -> String? {
+        line.split(separator: ":", maxSplits: 1)
+            .last?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     @discardableResult
@@ -1113,25 +1126,13 @@ struct RouteManager {
     }
 
     private func installSplitDefaultRoutes(gateway: String) throws {
-        _ = try Shell.run("/sbin/route",
-                          arguments: ["-n", "add", "-net", "0.0.0.0/1", gateway],
-                          allowNonZero: true,
-                          requirePrivileges: true)
-        _ = try Shell.run("/sbin/route",
-                          arguments: ["-n", "add", "-net", "128.0.0.0/1", gateway],
-                          allowNonZero: true,
-                          requirePrivileges: true)
+        try addIPv4NetRoute("0.0.0.0/1", gateway: gateway, allowNonZero: true)
+        try addIPv4NetRoute("128.0.0.0/1", gateway: gateway, allowNonZero: true)
     }
 
     private func installFailClosedTunnelDefaultRoutes(tunnelName: String) throws {
-        _ = try Shell.run("/sbin/route",
-                          arguments: ["-n", "add", "-net", "0.0.0.0/1", "-interface", tunnelName],
-                          allowNonZero: true,
-                          requirePrivileges: true)
-        _ = try Shell.run("/sbin/route",
-                          arguments: ["-n", "add", "-net", "128.0.0.0/1", "-interface", tunnelName],
-                          allowNonZero: true,
-                          requirePrivileges: true)
+        try addIPv4NetRoute("0.0.0.0/1", interfaceName: tunnelName, allowNonZero: true)
+        try addIPv4NetRoute("128.0.0.0/1", interfaceName: tunnelName, allowNonZero: true)
     }
 
     private func installSplitTunnelRouting(using state: SessionState,
@@ -1139,11 +1140,33 @@ struct RouteManager {
                                            tunnelName: String) throws {
         try installSplitDefaultRoutes(gateway: gateway)
         for route in cleanupIncludedRoutes(using: state) {
-            _ = try Shell.run("/sbin/route",
-                              arguments: ["-n", "add", "-net", route, "-interface", tunnelName],
-                              allowNonZero: true,
-                              requirePrivileges: true)
+            try addIPv4NetRoute(route, interfaceName: tunnelName, allowNonZero: true)
         }
+    }
+
+    private func deleteIPv4NetRoute(_ destination: String, allowNonZero: Bool) throws {
+        _ = try Shell.run("/sbin/route",
+                          arguments: ["-n", "delete", "-net", destination],
+                          allowNonZero: allowNonZero,
+                          requirePrivileges: true)
+    }
+
+    private func addIPv4NetRoute(_ destination: String,
+                                 gateway: String,
+                                 allowNonZero: Bool) throws {
+        _ = try Shell.run("/sbin/route",
+                          arguments: ["-n", "add", "-net", destination, gateway],
+                          allowNonZero: allowNonZero,
+                          requirePrivileges: true)
+    }
+
+    private func addIPv4NetRoute(_ destination: String,
+                                 interfaceName: String,
+                                 allowNonZero: Bool) throws {
+        _ = try Shell.run("/sbin/route",
+                          arguments: ["-n", "add", "-net", destination, "-interface", interfaceName],
+                          allowNonZero: allowNonZero,
+                          requirePrivileges: true)
     }
 
     private func resolvedFullTunnelDefaultRoutes(from capturedRoutes: [ManagedIPv4Route],

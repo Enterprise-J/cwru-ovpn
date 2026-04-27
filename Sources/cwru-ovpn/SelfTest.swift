@@ -283,6 +283,14 @@ enum SelfTest {
             throw SelfTestError.failed("connect --config should parse as connect.")
         }
 
+        switch try CLI.parse(arguments: ["connect", "--tunnel-mode", "full"]) {
+        case .connect(_, _, let tunnelModeOverride, _, _, _, _):
+            try expect(tunnelModeOverride == .full,
+                       "connect should keep accepting --tunnel-mode as an alias for --mode.")
+        default:
+            throw SelfTestError.failed("connect --tunnel-mode should parse as connect.")
+        }
+
         switch try CLI.parse(arguments: ["logs", "--tail", "25"]) {
         case .logs(let tailCount):
             try expect(tailCount == 25,
@@ -347,6 +355,15 @@ enum SelfTest {
         try expectRejectsInvalidPID(["cleanup-watchdog", "--parent-pid", "1"],
                                     command: "cleanup-watchdog",
                                     pid: "1")
+        try expectRejectsMissingValue(["connect", "--config"],
+                                      command: "connect",
+                                      argument: "--config")
+        try expectRejectsMissingValue(["logs", "--tail"],
+                                      command: "logs",
+                                      argument: "--tail")
+        try expectRejectsMissingValue(["setup", "--profile"],
+                                      command: "setup",
+                                      argument: "--profile")
     }
 
     private static func testGeneratedSudoers() throws {
@@ -1620,6 +1637,20 @@ enum SelfTest {
                        "\(command) should report the invalid PID value.")
         } catch {
             throw SelfTestError.failed("\(command) should reject \(pid) with an invalid PID error.")
+        }
+    }
+
+    private static func expectRejectsMissingValue(_ arguments: [String],
+                                                  command: String,
+                                                  argument expectedArgument: String) throws {
+        do {
+            _ = try CLI.parse(arguments: arguments)
+            throw SelfTestError.failed("\(command) should reject missing value for \(expectedArgument).")
+        } catch CLIError.missingValue(let argument) {
+            try expect(argument == expectedArgument,
+                       "\(command) should report \(expectedArgument) as the option missing a value.")
+        } catch {
+            throw SelfTestError.failed("\(command) should reject \(expectedArgument) with a missing value error.")
         }
     }
 }

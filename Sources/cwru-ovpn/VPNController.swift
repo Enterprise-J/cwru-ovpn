@@ -180,7 +180,7 @@ final class VPNController: NSObject {
         self.startupStatusFilePath = startupStatusFilePath.map { URL(fileURLWithPath: $0).standardized.path }
         self.sessionState = SessionState(
             pid: getpid(),
-            executablePath: try Self.currentExecutablePath(),
+            executablePath: try ExecutionIdentity.currentExecutablePath(),
             processStartTime: processStartTime(getpid()),
             phase: .connecting,
             profilePath: self.profilePath,
@@ -273,7 +273,7 @@ final class VPNController: NSObject {
             throw VPNControllerError.missingSession
         }
 
-        let expectedExecutablePath = try session.executablePath ?? currentExecutablePath()
+        let expectedExecutablePath = try session.executablePath ?? ExecutionIdentity.currentExecutablePath()
 
         if processExists(session.pid) {
             guard try signalValidatedProcess(pid: session.pid,
@@ -329,7 +329,7 @@ final class VPNController: NSObject {
             return false
         }
 
-        let expectedExecutablePath = try session.executablePath ?? currentExecutablePath()
+        let expectedExecutablePath = try session.executablePath ?? ExecutionIdentity.currentExecutablePath()
         if !processExists(session.pid) {
             if session.cleanupNeeded {
                 print("Recovering stale network state from the previous session before reconnecting.")
@@ -477,10 +477,6 @@ final class VPNController: NSObject {
         }
 
         return .pending(updatedSawRequestedMode: sawRequestedMode)
-    }
-
-    private static func currentExecutablePath() throws -> String {
-        try ExecutionIdentity.currentExecutablePath()
     }
 
     static func validateSessionForPrivilegedCleanup(_ session: SessionState) throws {
@@ -1392,7 +1388,7 @@ final class VPNController: NSObject {
     private func startCleanupWatchdog() {
         let process = Process()
         do {
-            process.executableURL = URL(fileURLWithPath: try Self.currentExecutablePath())
+            process.executableURL = URL(fileURLWithPath: try ExecutionIdentity.currentExecutablePath())
             var arguments = ["cleanup-watchdog", "--parent-pid", String(getpid())]
             if let startTime = sessionState.processStartTime {
                 arguments += ["--parent-start-seconds", String(startTime.seconds),
@@ -1456,7 +1452,7 @@ final class VPNController: NSObject {
     private func spawnManagedReconnect(_ request: ManagedReconnectRequest) {
         let process = Process()
         do {
-            process.executableURL = URL(fileURLWithPath: try Self.currentExecutablePath())
+            process.executableURL = URL(fileURLWithPath: try ExecutionIdentity.currentExecutablePath())
 
             var arguments = ["connect"]
             if let configFilePath = request.configFilePath {
@@ -1564,15 +1560,8 @@ final class VPNController: NSObject {
             }
         }
 
-        let normalizedDNSServers = Array(NSOrderedSet(array: dnsServers.compactMap { value -> String? in
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        })) as? [String] ?? []
-
-        let normalizedSearchDomains = Array(NSOrderedSet(array: searchDomains.compactMap { value -> String? in
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        })) as? [String] ?? []
+        let normalizedDNSServers = uniqueTrimmedNonEmptyStrings(dnsServers)
+        let normalizedSearchDomains = uniqueTrimmedNonEmptyStrings(searchDomains)
 
         guard !normalizedDNSServers.isEmpty || !normalizedSearchDomains.isEmpty else {
             return
@@ -1596,8 +1585,7 @@ final class VPNController: NSObject {
     }
 
     private func bracketFields(in line: String) -> [String] {
-        let pattern = #"\[([^\]\r\n]+)\]"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+        guard let regex = Self.bracketFieldRegex else {
             return []
         }
         let range = NSRange(line.startIndex..., in: line)
@@ -1608,6 +1596,22 @@ final class VPNController: NSObject {
             }
             return String(line[valueRange])
         }
+    }
+
+    private static let bracketFieldRegex = try? NSRegularExpression(pattern: #"\[([^\]\r\n]+)\]"#)
+
+    private func uniqueTrimmedNonEmptyStrings(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+
+        for value in values {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, seen.insert(trimmed).inserted {
+                result.append(trimmed)
+            }
+        }
+
+        return result
     }
 
     private func extractInfoPayload(fromAppControlMessage info: String) -> String? {

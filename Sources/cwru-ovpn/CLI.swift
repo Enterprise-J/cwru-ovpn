@@ -94,12 +94,9 @@ enum CLI {
                 let argument = arguments[index]
                 switch argument {
                 case "--tail":
-                    let nextIndex = index + 1
-                    guard nextIndex < arguments.count else {
-                        throw CLIError.missingValue(argument)
-                    }
-                    guard let parsedTailCount = Int(arguments[nextIndex]), parsedTailCount > 0 else {
-                        throw CLIError.unexpectedArgument(arguments[nextIndex])
+                    let value = try requiredValue(after: argument, at: index, in: arguments)
+                    guard let parsedTailCount = Int(value), parsedTailCount > 0 else {
+                        throw CLIError.unexpectedArgument(value)
                     }
                     tailCount = parsedTailCount
                     index += 2
@@ -139,11 +136,7 @@ enum CLI {
                 let argument = arguments[index]
                 switch argument {
                 case "--profile":
-                    let nextIndex = index + 1
-                    guard nextIndex < arguments.count else {
-                        throw CLIError.missingValue(argument)
-                    }
-                    profileSourcePath = arguments[nextIndex]
+                    profileSourcePath = try requiredValue(after: argument, at: index, in: arguments)
                     index += 2
                 default:
                     throw CLIError.unexpectedArgument(argument)
@@ -160,18 +153,10 @@ enum CLI {
                 let argument = arguments[index]
                 switch argument {
                 case "--shell":
-                    let nextIndex = index + 1
-                    guard nextIndex < arguments.count else {
-                        throw CLIError.missingValue(argument)
-                    }
-                    preferredShellPath = arguments[nextIndex]
+                    preferredShellPath = try requiredValue(after: argument, at: index, in: arguments)
                     index += 2
                 case "--legacy-source":
-                    let nextIndex = index + 1
-                    guard nextIndex < arguments.count else {
-                        throw CLIError.missingValue(argument)
-                    }
-                    legacySourcePaths.append(arguments[nextIndex])
+                    legacySourcePaths.append(try requiredValue(after: argument, at: index, in: arguments))
                     index += 2
                 default:
                     throw CLIError.unexpectedArgument(argument)
@@ -205,33 +190,24 @@ enum CLI {
                 let argument = arguments[index]
                 switch argument {
                 case "--parent-pid":
-                    let nextIndex = index + 1
-                    guard nextIndex < arguments.count else {
-                        throw CLIError.missingValue(argument)
-                    }
-                    guard let parsed = Int32(arguments[nextIndex]),
+                    let value = try requiredValue(after: argument, at: index, in: arguments)
+                    guard let parsed = Int32(value),
                           parsed > 1 else {
-                        throw CLIError.invalidPID(arguments[nextIndex])
+                        throw CLIError.invalidPID(value)
                     }
                     parentPID = parsed
                     index += 2
                 case "--parent-start-seconds":
-                    let nextIndex = index + 1
-                    guard nextIndex < arguments.count else {
-                        throw CLIError.missingValue(argument)
-                    }
-                    guard let parsed = UInt64(arguments[nextIndex]) else {
-                        throw CLIError.unexpectedArgument(arguments[nextIndex])
+                    let value = try requiredValue(after: argument, at: index, in: arguments)
+                    guard let parsed = UInt64(value) else {
+                        throw CLIError.unexpectedArgument(value)
                     }
                     parentStartSeconds = parsed
                     index += 2
                 case "--parent-start-microseconds":
-                    let nextIndex = index + 1
-                    guard nextIndex < arguments.count else {
-                        throw CLIError.missingValue(argument)
-                    }
-                    guard let parsed = UInt64(arguments[nextIndex]) else {
-                        throw CLIError.unexpectedArgument(arguments[nextIndex])
+                    let value = try requiredValue(after: argument, at: index, in: arguments)
+                    guard let parsed = UInt64(value) else {
+                        throw CLIError.unexpectedArgument(value)
                     }
                     parentStartMicroseconds = parsed
                     index += 2
@@ -269,29 +245,19 @@ enum CLI {
             let argument = arguments[index]
             switch argument {
             case "--config":
-                let nextIndex = index + 1
-                guard nextIndex < arguments.count else {
-                    throw CLIError.missingValue(argument)
-                }
-                configFilePath = arguments[nextIndex]
+                configFilePath = try requiredValue(after: argument, at: index, in: arguments)
                 index += 2
             case "--verbosity":
-                let nextIndex = index + 1
-                guard nextIndex < arguments.count else {
-                    throw CLIError.missingValue(argument)
-                }
-                guard let parsed = AppVerbosity(rawValue: arguments[nextIndex]) else {
-                    throw CLIError.invalidVerbosity(arguments[nextIndex])
+                let value = try requiredValue(after: argument, at: index, in: arguments)
+                guard let parsed = AppVerbosity(rawValue: value) else {
+                    throw CLIError.invalidVerbosity(value)
                 }
                 verbosityOverride = parsed
                 index += 2
             case "--mode", "--tunnel-mode":
-                let nextIndex = index + 1
-                guard nextIndex < arguments.count else {
-                    throw CLIError.missingValue(argument)
-                }
-                guard let parsed = AppTunnelMode(rawValue: arguments[nextIndex]) else {
-                    throw CLIError.invalidTunnelMode(arguments[nextIndex])
+                let value = try requiredValue(after: argument, at: index, in: arguments)
+                guard let parsed = AppTunnelMode(rawValue: value) else {
+                    throw CLIError.invalidTunnelMode(value)
                 }
                 tunnelModeOverride = parsed
                 index += 2
@@ -305,11 +271,7 @@ enum CLI {
                 backgroundChild = true
                 index += 1
             case "--startup-status-file":
-                let nextIndex = index + 1
-                guard nextIndex < arguments.count else {
-                    throw CLIError.missingValue(argument)
-                }
-                startupStatusFilePath = arguments[nextIndex]
+                startupStatusFilePath = try requiredValue(after: argument, at: index, in: arguments)
                 index += 2
             default:
                 throw CLIError.unexpectedArgument(argument)
@@ -323,6 +285,16 @@ enum CLI {
                         foregroundRequested: foregroundRequested,
                         backgroundChild: backgroundChild,
                         startupStatusFilePath: startupStatusFilePath)
+    }
+
+    private static func requiredValue(after argument: String,
+                                      at index: Int,
+                                      in arguments: [String]) throws -> String {
+        let valueIndex = index + 1
+        guard valueIndex < arguments.count else {
+            throw CLIError.missingValue(argument)
+        }
+        return arguments[valueIndex]
     }
 
     static func printHelp() {
@@ -350,7 +322,7 @@ enum CLI {
         Connect options:
           --config PATH        Path to the config JSON file
           --verbosity LEVEL    Logging level: silent, daily, debug (default: daily)
-          --mode MODE          Tunnel mode: full or split (default from config)
+          --mode MODE          Tunnel mode: full or split; --tunnel-mode also works
           --allow-sleep        Allow system sleep for this run
           --foreground         Keep the controller attached to the terminal
 

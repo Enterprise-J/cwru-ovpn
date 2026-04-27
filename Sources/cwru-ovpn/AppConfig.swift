@@ -225,21 +225,11 @@ struct AppConfig: Codable {
     )
 
     static func load(explicitConfigPath: String?) throws -> AppConfig {
-        if let explicitConfigPath {
-            return try decode(from: URL(fileURLWithPath: expandUserPath(explicitConfigPath)))
+        guard let configURL = resolvedConfigURL(explicitConfigPath: explicitConfigPath) else {
+            return fallback
         }
 
-        if let environmentConfigPath = configPathFromEnvironment() {
-            return try decode(from: URL(fileURLWithPath: expandUserPath(environmentConfigPath)))
-        }
-
-        for candidate in candidateURLs() {
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return try decode(from: candidate)
-            }
-        }
-
-        return fallback
+        return try decode(from: configURL)
     }
 
     static func resolvedConfigURL(explicitConfigPath: String?) -> URL? {
@@ -251,13 +241,9 @@ struct AppConfig: Codable {
             return URL(fileURLWithPath: expandUserPath(environmentConfigPath)).standardized
         }
 
-        for candidate in candidateURLs() {
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return candidate.standardized
-            }
-        }
-
-        return nil
+        return candidateURLs().first {
+            FileManager.default.fileExists(atPath: $0.path)
+        }?.standardized
     }
 
     func resolvedProfilePath(explicitConfigPath: String?) throws -> String {
@@ -288,13 +274,7 @@ struct AppConfig: Codable {
     }
 
     private static func configPathFromEnvironment() -> String? {
-        let environment = ProcessInfo.processInfo.environment
-        for key in ["CWRU_OVPN_CONFIG"] {
-            if let value = environment[key], !value.isEmpty {
-                return value
-            }
-        }
-        return nil
+        ProcessInfo.processInfo.environment["CWRU_OVPN_CONFIG"].flatMap { $0.isEmpty ? nil : $0 }
     }
 
     private static func decode(from url: URL) throws -> AppConfig {
