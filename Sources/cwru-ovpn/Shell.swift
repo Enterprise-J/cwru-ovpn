@@ -12,6 +12,7 @@ struct ShellInvocation {
     let input: Data?
     let allowNonZero: Bool
     let requirePrivileges: Bool
+    let environment: [String: String]?
 }
 
 private final class PipeCollector: @unchecked Sendable {
@@ -48,6 +49,12 @@ enum ShellError: LocalizedError {
 }
 
 enum Shell {
+    private static let privilegedSubprocessEnvironment = [
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "C",
+        "LC_ALL": "C",
+    ]
+
 #if CWRU_OVPN_INCLUDE_SELF_TEST
     private static let testHookLock = NSLock()
     nonisolated(unsafe) private static var testHook: ((ShellInvocation) throws -> ShellResult?)?
@@ -82,11 +89,13 @@ enum Shell {
                     input: Data? = nil,
                     allowNonZero: Bool = false,
                     requirePrivileges: Bool = false) throws -> ShellResult {
+        let environment = requirePrivileges ? privilegedSubprocessEnvironment : nil
         let invocation = ShellInvocation(launchPath: launchPath,
                                          arguments: arguments,
                                          input: input,
                                          allowNonZero: allowNonZero,
-                                         requirePrivileges: requirePrivileges)
+                                         requirePrivileges: requirePrivileges,
+                                         environment: environment)
 
 #if CWRU_OVPN_INCLUDE_SELF_TEST
         if let hookedResult = try invokeTestHook(invocation) {
@@ -102,6 +111,9 @@ enum Shell {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: requirePrivileges && geteuid() != 0 ? "/usr/bin/sudo" : launchPath)
         process.arguments = requirePrivileges && geteuid() != 0 ? [launchPath] + arguments : arguments
+        if let environment {
+            process.environment = environment
+        }
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()

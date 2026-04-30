@@ -85,6 +85,7 @@ private struct EventLogSessionRecord: Encodable {
     let pid: Int32
     let profilePath: String
     let stateDirectory: String
+    let privacyMode: Bool
 }
 
 private struct EventLogVPNRecord: Encodable {
@@ -107,13 +108,24 @@ private struct EventLogNoteRecord: Encodable {
 }
 
 enum EventLog {
+    private static let privacyLock = NSLock()
+    nonisolated(unsafe) private static var privacyMode = false
+
+    static func configure(privacyMode enabled: Bool) {
+        privacyLock.lock()
+        privacyMode = enabled
+        privacyLock.unlock()
+    }
+
     static func startSession(profilePath: String) {
         resetForNewSession()
+        let privacyMode = isPrivacyModeEnabled()
         appendRecord(EventLogSessionRecord(
             timestamp: timestampString(),
             pid: getpid(),
-            profilePath: profilePath,
-            stateDirectory: RuntimePaths.stateDirectory.path
+            profilePath: privacyMode ? "[redacted]" : profilePath,
+            stateDirectory: privacyMode ? "[redacted]" : RuntimePaths.stateDirectory.path,
+            privacyMode: privacyMode
         ))
     }
 
@@ -140,7 +152,7 @@ enum EventLog {
             pid: getpid(),
             phase: phase.rawValue,
             name: eventName,
-            info: sanitize(info),
+            info: eventInfoForStorage(info),
             isError: isError,
             isFatal: isFatal
         ))
@@ -151,7 +163,7 @@ enum EventLog {
             timestamp: timestampString(),
             pid: getpid(),
             phase: phase?.rawValue,
-            message: sanitize(note)
+            message: noteForStorage(note)
         ))
     }
 
@@ -214,6 +226,21 @@ enum EventLog {
 
     private static func sanitize(_ value: String) -> String {
         redactSensitiveText(value)
+    }
+
+    private static func eventInfoForStorage(_ value: String) -> String {
+        isPrivacyModeEnabled() ? "[suppressed]" : sanitize(value)
+    }
+
+    private static func noteForStorage(_ value: String) -> String {
+        isPrivacyModeEnabled() ? "Detail suppressed by privacy mode." : sanitize(value)
+    }
+
+    private static func isPrivacyModeEnabled() -> Bool {
+        privacyLock.lock()
+        let enabled = privacyMode
+        privacyLock.unlock()
+        return enabled
     }
 
     nonisolated(unsafe) private static let timestampFormatter: ISO8601DateFormatter = {

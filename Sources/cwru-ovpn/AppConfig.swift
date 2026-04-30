@@ -60,6 +60,11 @@ enum AppConfigError: LocalizedError {
 
 struct AppConfig: Codable {
     struct SplitTunnelConfiguration: Codable {
+        static let maxIPv4CIDRLength = 18
+        static let maxIPAddressLength = 45
+        static let maxDomainNameLength = 253
+        static let maxDomainLabelLength = 63
+
         static let defaultReachabilityProbeHosts = [
             "1.1.1.1",
             "8.8.8.8",
@@ -147,6 +152,10 @@ struct AppConfig: Codable {
             return nil
         }
         static func isValidCIDR(_ value: String) -> Bool {
+            guard !value.isEmpty, value.count <= maxIPv4CIDRLength else {
+                return false
+            }
+
             let parts = value.split(separator: "/", maxSplits: 1)
             guard parts.count == 2,
                   let prefixLength = Int(parts[1]),
@@ -158,12 +167,16 @@ struct AppConfig: Codable {
         }
 
         static func isValidDomainName(_ value: String) -> Bool {
-            guard !value.isEmpty, !value.hasPrefix("."), !value.hasSuffix(".") else {
+            guard !value.isEmpty,
+                  value.utf8.count <= maxDomainNameLength,
+                  !value.hasPrefix("."),
+                  !value.hasSuffix(".") else {
                 return false
             }
             return value.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
                 let s = String(label)
                 return !s.isEmpty
+                    && s.utf8.count <= maxDomainLabelLength
                     && s.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
                     && !s.hasPrefix("-")
                     && !s.hasSuffix("-")
@@ -171,6 +184,10 @@ struct AppConfig: Codable {
         }
 
         static func isValidIPAddress(_ value: String) -> Bool {
+            guard !value.isEmpty, value.count <= maxIPAddressLength else {
+                return false
+            }
+
             var addr4 = in_addr()
             var addr6 = in6_addr()
             return value.withCString { ptr in
@@ -201,6 +218,7 @@ struct AppConfig: Codable {
     var profilePath: String?
     var tunnelMode: AppTunnelMode
     var preventSleep: Bool
+    var privacyMode: Bool
     var splitTunnel: SplitTunnelConfiguration
     var verbosity: AppVerbosity
 
@@ -215,6 +233,7 @@ struct AppConfig: Codable {
         profilePath: nil,
         tunnelMode: .split,
         preventSleep: true,
+        privacyMode: false,
         splitTunnel: SplitTunnelConfiguration(
             includedRoutes: [],
             resolverDomains: [],
@@ -291,6 +310,7 @@ struct AppConfig: Codable {
         case profilePath
         case tunnelMode
         case preventSleep
+        case privacyMode
         case splitTunnel
         case verbosity
     }
@@ -302,11 +322,13 @@ struct AppConfig: Codable {
     init(profilePath: String?,
          tunnelMode: AppTunnelMode,
          preventSleep: Bool,
+         privacyMode: Bool,
          splitTunnel: SplitTunnelConfiguration,
          verbosity: AppVerbosity) {
         self.profilePath = profilePath
         self.tunnelMode = tunnelMode
         self.preventSleep = preventSleep
+        self.privacyMode = privacyMode
         self.splitTunnel = splitTunnel
         self.verbosity = verbosity
     }
@@ -316,6 +338,7 @@ struct AppConfig: Codable {
         try container.encodeIfPresent(profilePath, forKey: .profilePath)
         try container.encode(tunnelMode, forKey: .tunnelMode)
         try container.encode(preventSleep, forKey: .preventSleep)
+        try container.encode(privacyMode, forKey: .privacyMode)
         try container.encode(splitTunnel, forKey: .splitTunnel)
         try container.encode(verbosity, forKey: .verbosity)
     }
@@ -328,6 +351,7 @@ struct AppConfig: Codable {
             ?? legacyContainer.decodeIfPresent(String.self, forKey: .defaultProfilePath)
         tunnelMode = try container.decodeIfPresent(AppTunnelMode.self, forKey: .tunnelMode) ?? Self.fallback.tunnelMode
         preventSleep = try container.decodeIfPresent(Bool.self, forKey: .preventSleep) ?? Self.fallback.preventSleep
+        privacyMode = try container.decodeIfPresent(Bool.self, forKey: .privacyMode) ?? Self.fallback.privacyMode
         splitTunnel = try container.decodeIfPresent(SplitTunnelConfiguration.self, forKey: .splitTunnel) ?? Self.fallback.splitTunnel
         verbosity = try container.decodeIfPresent(AppVerbosity.self, forKey: .verbosity) ?? .daily
     }

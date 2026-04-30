@@ -2,6 +2,7 @@
   "profilePath": "~/.cwru-ovpn/profile.ovpn",
   "tunnelMode": "split",
   "preventSleep": true,
+  "privacyMode": false,
   "verbosity": "daily",
   "splitTunnel": {
     "includedRoutes": [

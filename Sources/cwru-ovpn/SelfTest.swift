@@ -26,13 +26,16 @@ enum SelfTest {
         try testCLIConnectModes()
         try testCLIAdvancedOptions()
         try testGeneratedSudoers()
+        try testPrivacyModeEventLog()
         try testRecoveryState()
         try testStatusIndicators()
         try testRouteCanonicalization()
         try testReverseResolverZoneDerivation()
+        try testPrivilegedShellEnvironment()
         try testDetachedStartupStatus()
         try testShellIntegrationBlocks()
         try testPhysicalDNSCapture()
+        try testPhysicalDNSCaptureRejectsUnsafeServiceName()
         try testMockedSplitTunnelFlow()
         try testSplitTunnelRejectsLeakyDefaultDNS()
         try testSplitTunnelAllowsSupplementalDefaultSearchDomains()
@@ -375,8 +378,8 @@ enum SelfTest {
                                           executableDigest: executableDigest)
 
         let lines = sudoers.split(separator: "\n").map(String.init)
-        try expect(lines.count == 22,
-                   "Generated sudoers should cover the standard connect combinations plus disconnect (plain, -f, and --force) and plain setup.")
+        try expect(lines.count == 21,
+                   "Generated sudoers should cover the standard connect combinations plus disconnect (plain, -f, and --force).")
         try expect(sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) connect --allow-sleep"),
                    "Generated sudoers should include the allow-sleep connect variant.")
         try expect(!lines.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) connect --foreground"),
@@ -387,8 +390,8 @@ enum SelfTest {
                    "Generated sudoers should allow disconnect -f for shell-friendly force disconnects.")
         try expect(sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) disconnect --force"),
                    "Generated sudoers should allow disconnect --force for stuck sessions.")
-        try expect(sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) setup"),
-                   "Generated sudoers should allow plain setup.")
+        try expect(!sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) setup"),
+                   "Generated sudoers should not allow passwordless setup.")
         try expect(!sudoers.contains("#\(userID) ALL=(root) NOPASSWD: sha256:\(executableDigest) \(executablePath) status"),
                    "Generated sudoers should not grant passwordless access to status.")
         try expect(!sudoers.contains("--config"),
@@ -406,6 +409,37 @@ enum SelfTest {
         let validation = try Setup.validateSudoersFile(at: tempURL.path)
         try expect(validation.exitCode == 0,
                    "Generated sudoers should pass visudo validation.")
+        try Setup.validatePasswordlessInvocationPolicy(executablePath: executablePath)
+    }
+
+    private static func testPrivacyModeEventLog() throws {
+        let homeStateDirectory = temporaryDirectory(named: "cwru-ovpn-private-log-state")
+        defer {
+            EventLog.configure(privacyMode: false)
+            try? FileManager.default.removeItem(at: homeStateDirectory)
+        }
+
+        try withEnvironmentVariable("CWRU_OVPN_HOME_STATE_DIR", value: homeStateDirectory.path) {
+            EventLog.configure(privacyMode: true)
+            EventLog.startSession(profilePath: "/private/tmp/sensitive-profile.ovpn")
+            EventLog.append(eventName: "LOG",
+                            info: "OPEN_URL:https://login.example/callback?token=secret",
+                            isError: false,
+                            isFatal: false,
+                            phase: .connecting)
+            EventLog.append(note: "Learned live VPN DNS servers: 10.8.0.2",
+                            phase: .connected)
+
+            let logText = try String(contentsOf: RuntimePaths.eventLogFile, encoding: .utf8)
+            try expect(logText.contains(#""privacyMode":true"#),
+                       "Privacy-mode event logs should mark the session as privacy mode.")
+            try expect(!logText.contains("sensitive-profile.ovpn"),
+                       "Privacy-mode event logs should suppress profile paths.")
+            try expect(!logText.contains("https://login.example"),
+                       "Privacy-mode event logs should suppress raw event info.")
+            try expect(!logText.contains("10.8.0.2"),
+                       "Privacy-mode event logs should suppress note details.")
+        }
     }
 
     private static func testRuntimeValidationHardening() throws {
@@ -417,6 +451,70 @@ enum SelfTest {
                    "Expected resolver domains should validate.")
         try expect(!AppConfig.SplitTunnelConfiguration.isValidDomainName("case.edu/../../etc"),
                    "Path-like resolver domains should be rejected.")
+        try testValidatorTable(
+            name: "CIDR",
+            valid: ["0.0.0.0/0", "129.22.0.0/16", "255.255.255.255/32"],
+            invalid: [
+                "",
+                "129.22.0.0/33",
+                "129.22.0.0/-1",
+                "129.22.0.0/16\n",
+                String(repeating: "1", count: AppConfig.SplitTunnelConfiguration.maxIPv4CIDRLength + 1),
+            ],
+            validator: AppConfig.SplitTunnelConfiguration.isValidCIDR
+        )
+        try testValidatorTable(
+            name: "IP address",
+            valid: ["1.1.1.1", "2001:db8::1"],
+            invalid: [
+                "",
+                "-1.1.1.1",
+                "1.1.1.1\nnameserver 8.8.8.8",
+                String(repeating: "1", count: AppConfig.SplitTunnelConfiguration.maxIPAddressLength + 1),
+            ],
+            validator: AppConfig.SplitTunnelConfiguration.isValidIPAddress
+        )
+        try testValidatorTable(
+            name: "domain",
+            valid: ["case.edu", "\(String(repeating: "a", count: AppConfig.SplitTunnelConfiguration.maxDomainLabelLength)).edu"],
+            invalid: [
+                "",
+                ".case.edu",
+                "case.edu.",
+                "-case.edu",
+                "case-.edu",
+                "case.edu/../../etc",
+                "bad domain",
+                "bad\ncase.edu",
+                "\(String(repeating: "a", count: AppConfig.SplitTunnelConfiguration.maxDomainLabelLength + 1)).edu",
+                String(repeating: "a", count: AppConfig.SplitTunnelConfiguration.maxDomainNameLength + 1),
+            ],
+            validator: AppConfig.SplitTunnelConfiguration.isValidDomainName
+        )
+        try testValidatorTable(
+            name: "reachability probe host",
+            valid: ["cloudflare.com", "1.1.1.1", "2001:db8::1"],
+            invalid: [
+                "",
+                "bad host",
+                "host/../../etc",
+                String(repeating: "a", count: AppConfig.SplitTunnelConfiguration.maxDomainNameLength + 1),
+            ],
+            validator: AppConfig.SplitTunnelConfiguration.isValidReachabilityProbeHost
+        )
+        try testValidatorTable(
+            name: "resolver filename",
+            valid: ["case.edu", "22.129.in-addr.arpa"],
+            invalid: [
+                "",
+                ".",
+                "..",
+                "case.edu/../../etc",
+                String(repeating: "a", count: AppConfig.SplitTunnelConfiguration.maxDomainNameLength + 1),
+            ],
+            validator: ResolverPaths.isSafeDomainFileName
+        )
+        try testPrivilegedCleanupInputBounds()
         let currentStartTime = processStartTime(getpid())
         try expect(currentStartTime != nil,
                    "Current-process start times should be readable for PID validation.")
@@ -429,6 +527,63 @@ enum SelfTest {
             let expanded = AppConfig.expandUserPath("~/profile.ovpn")
             try expect(!expanded.hasPrefix("/var/root/"),
                        "Non-root runs should ignore spoofed SUDO_USER values when expanding ~ paths.")
+        }
+    }
+
+    private static func testValidatorTable(name: String,
+                                           valid: [String],
+                                           invalid: [String],
+                                           validator: (String) -> Bool) throws {
+        for value in valid {
+            try expect(validator(value), "\(name) validator should accept '\(value)'.")
+        }
+        for value in invalid {
+            try expect(!validator(value), "\(name) validator should reject '\(value)'.")
+        }
+    }
+
+    private static func testPrivilegedCleanupInputBounds() throws {
+        var base = makeSessionState(
+            pid: 2001,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        base.appliedIncludedRoutes = ["129.22.0.0/16"]
+        base.appliedResolverDomains = ["case.edu"]
+        try VPNController.validateSessionForPrivilegedCleanup(base)
+
+        let tooLongDomain = "\(String(repeating: "a", count: AppConfig.SplitTunnelConfiguration.maxDomainLabelLength + 1)).edu"
+        let cases: [(String, (inout SessionState) -> Void)] = [
+            ("tunnel interface", { $0.tunName = String(repeating: "u", count: 33) }),
+            ("physical interface", { $0.physicalInterface = String(repeating: "e", count: 33) }),
+            ("network service", { $0.physicalServiceName = String(repeating: "W", count: 129) }),
+            ("server IP", { $0.serverIP = String(repeating: "1", count: AppConfig.SplitTunnelConfiguration.maxIPAddressLength + 1) }),
+            ("gateway", { $0.physicalGateway = String(repeating: "1", count: AppConfig.SplitTunnelConfiguration.maxIPAddressLength + 1) }),
+            ("included route", { $0.appliedIncludedRoutes = [String(repeating: "1", count: AppConfig.SplitTunnelConfiguration.maxIPv4CIDRLength + 1)] }),
+            ("resolver domain", { $0.appliedResolverDomains = [tooLongDomain] }),
+            ("profile path", { $0.profilePath = "/" + String(repeating: "a", count: 1024) }),
+            ("profile path control", { $0.profilePath = "/tmp/profile\n.ovpn" }),
+        ]
+
+        for (label, mutate) in cases {
+            var session = base
+            mutate(&session)
+            do {
+                try VPNController.validateSessionForPrivilegedCleanup(session)
+                throw SelfTestError.failed("Privileged cleanup validation should reject \(label).")
+            } catch VPNControllerError.unsafeSessionState(_) {
+            } catch {
+                throw error
+            }
         }
     }
 
@@ -543,6 +698,33 @@ enum SelfTest {
                    "effectiveResolverDomains should merge user domains with derived reverse zones.")
     }
 
+    private static func testPrivilegedShellEnvironment() throws {
+        var privilegedInvocation: ShellInvocation?
+        _ = try Shell.withTestHook({ invocation in
+            privilegedInvocation = invocation
+            return ShellResult(exitCode: 0, stdout: "", stderr: "")
+        }) {
+            try Shell.run("/bin/echo", arguments: ["ok"], requirePrivileges: true)
+        }
+
+        try expect(privilegedInvocation?.environment == [
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "LANG": "C",
+            "LC_ALL": "C",
+        ], "Privileged subprocesses should use a deterministic minimal environment.")
+
+        var unprivilegedInvocation: ShellInvocation?
+        _ = try Shell.withTestHook({ invocation in
+            unprivilegedInvocation = invocation
+            return ShellResult(exitCode: 0, stdout: "", stderr: "")
+        }) {
+            try Shell.run("/bin/echo", arguments: ["ok"])
+        }
+
+        try expect(unprivilegedInvocation?.environment == nil,
+                   "Unprivileged subprocesses should keep the default inherited environment.")
+    }
+
     private static func testDetachedStartupStatus() throws {
         let tempURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("cwru-ovpn-startup-status-\(UUID().uuidString).json")
@@ -641,6 +823,14 @@ enum SelfTest {
                        "Applying split tunnel should install scoped resolver files with VPN DNS servers.")
             try expect(FileManager.default.fileExists(atPath: reverseResolverFile.path),
                        "Applying split tunnel should install reverse-zone resolver files for included routes.")
+            try expect(mockSystem.recordedCommands.contains("/usr/sbin/chown root:wheel \(resolverFile.path)"),
+                       "Applying split tunnel should enforce root:wheel ownership on resolver files.")
+            try expect(mockSystem.recordedCommands.contains("/bin/chmod 0644 \(resolverFile.path)"),
+                       "Applying split tunnel should enforce 0644 mode on resolver files.")
+            try expect(mockSystem.recordedCommands.contains("/usr/sbin/chown root:wheel \(reverseResolverFile.path)"),
+                       "Applying split tunnel should enforce root:wheel ownership on reverse-zone resolver files.")
+            try expect(mockSystem.recordedCommands.contains("/bin/chmod 0644 \(reverseResolverFile.path)"),
+                       "Applying split tunnel should enforce 0644 mode on reverse-zone resolver files.")
         }
         try expect(mockSystem.recordedCommands.contains("/sbin/route -n add -net 0.0.0.0/1 192.168.1.1"),
                    "Applying split tunnel should add the lower-half default route override.")
@@ -677,6 +867,31 @@ enum SelfTest {
             try expect(captured?.ipv6Mode == "Automatic",
                        "Physical DNS capture should read the original IPv6 mode.")
         }
+    }
+
+    private static func testPhysicalDNSCaptureRejectsUnsafeServiceName() throws {
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        let mockSystem = MockSystem(serviceName: String(repeating: "W", count: 129),
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    tunnelInterfaces: ["utun7"])
+
+        try Shell.withTestHook({ try mockSystem.handle($0) }) {
+            let captured = try RouteManager(configuration: configuration).capturePhysicalDNSConfiguration(for: "en0")
+            try expect(captured == nil,
+                       "Physical DNS capture should reject unsafe network service names before using them in networksetup calls.")
+        }
+        try expect(!mockSystem.recordedCommands.contains { $0.contains("-getdnsservers") },
+                   "Unsafe network service names should not be passed to networksetup DNS commands.")
     }
 
     private static func testSplitTunnelRejectsLeakyDefaultDNS() throws {
@@ -1396,6 +1611,17 @@ enum SelfTest {
                     try FileManager.default.createDirectory(atPath: invocation.arguments[1],
                                                             withIntermediateDirectories: true,
                                                             attributes: nil)
+                    return ShellResult(exitCode: 0, stdout: "", stderr: "")
+                }
+            case "/usr/sbin/chown":
+                if invocation.arguments.count == 2 {
+                    return ShellResult(exitCode: 0, stdout: "", stderr: "")
+                }
+            case "/bin/chmod":
+                if invocation.arguments.count == 2 {
+                    let mode = Int(invocation.arguments[0], radix: 8) ?? 0o644
+                    try FileManager.default.setAttributes([.posixPermissions: mode],
+                                                          ofItemAtPath: invocation.arguments[1])
                     return ShellResult(exitCode: 0, stdout: "", stderr: "")
                 }
             case "/usr/bin/tee":

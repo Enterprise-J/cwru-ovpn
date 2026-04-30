@@ -2,7 +2,7 @@
 
 Native macOS client for Case Western Reserve University OpenVPN profiles, built on OpenVPN 3.
 
-- Version: `0.4.2`
+- Version: `0.4.3`
 - Requires: Apple Silicon and macOS 14 or later for prebuilt installs
 - Modes: full tunnel and split tunnel, switchable while connected
 - Scope: no launch daemon and no login item
@@ -71,14 +71,14 @@ sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn <command> [options]
 | `status` | Print status |
 | `logs` | Print recent events; `--tail COUNT` defaults to `40` |
 | `doctor` | Print config, session, resolver, and live `utun*` diagnostics |
-| `setup` | Install sudoers rules; `--profile PATH` imports a profile |
+| `setup` | Install the privileged binary and sudoers rules; `--profile PATH` imports a profile |
 | `uninstall` | Remove sudoers, shell shortcuts, and resolver files; `--purge` also removes `~/.cwru-ovpn` |
 | `version` | Print version |
 | `help` | Print built-in help |
 
 `connect` accepts `--config PATH`, `--verbosity silent|daily|debug`, `--mode full|split` (`--tunnel-mode` also works), `--allow-sleep`, and `--foreground`.
 
-Passwordless `sudo` is intentionally narrow and order-sensitive. It covers canonical `connect`, `connect --mode full|split`, the same forms with `--verbosity debug`, optional debug `--foreground`, optional trailing `--allow-sleep`, `disconnect`, `disconnect -f`, `disconnect --force`, and plain `setup`.
+Passwordless `sudo` is intentionally narrow and order-sensitive. It covers canonical `connect`, `connect --mode full|split`, the same forms with `--verbosity debug`, optional debug `--foreground`, optional trailing `--allow-sleep`, `disconnect`, `disconnect -f`, and `disconnect --force`. Setup requires interactive `sudo`.
 
 ## Config
 
@@ -89,6 +89,7 @@ The default config is `~/.cwru-ovpn/config.json`. A template lives at [`examples
 | `profilePath` | `.ovpn` profile path |
 | `tunnelMode` | `split` or `full` |
 | `preventSleep` | `true` by default |
+| `privacyMode` | `false` by default; when `true`, event logs suppress path and event details |
 | `verbosity` | `silent`, `daily`, or `debug` |
 | `splitTunnel.includedRoutes` | IPv4 CIDRs routed through VPN |
 | `splitTunnel.resolverDomains` | Domains written to scoped `/etc/resolver` files |

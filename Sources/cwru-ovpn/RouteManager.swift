@@ -104,6 +104,9 @@ struct RouteManager {
         guard let serviceName = try serviceName(for: interfaceName) else {
             return nil
         }
+        guard isSafeNetworkServiceName(serviceName) else {
+            return nil
+        }
 
         let dnsServersOutput = try Shell.run("/usr/sbin/networksetup",
                                              arguments: ["-getdnsservers", serviceName],
@@ -401,7 +404,17 @@ struct RouteManager {
                                   input: Data(content.utf8),
                                   requirePrivileges: true)
             }
+            try hardenResolverFile(at: resolverFile)
         }
+    }
+
+    private func hardenResolverFile(at resolverFile: URL) throws {
+        _ = try Shell.run("/usr/sbin/chown",
+                          arguments: ["root:wheel", resolverFile.path],
+                          requirePrivileges: true)
+        _ = try Shell.run("/bin/chmod",
+                          arguments: ["0644", resolverFile.path],
+                          requirePrivileges: true)
     }
 
     private func removeResolverFiles(using state: SessionState) throws {
@@ -1216,6 +1229,18 @@ struct RouteManager {
         }
     }
 
+    private let safeNetworkServiceNameAllowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -./()_+'&")
+
+    private func isSafeNetworkServiceName(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              !value.hasPrefix("-"),
+              value.count <= 128 else {
+            return false
+        }
+
+        return value.unicodeScalars.allSatisfy { safeNetworkServiceNameAllowedCharacters.contains($0) }
+    }
+
     private func validatedTunnelInterfaceName(_ tunnelName: String) throws -> String {
         guard isSafeInterfaceName(tunnelName) else {
             throw RouteManagerError.invalidTunnelInterface
@@ -1307,6 +1332,10 @@ struct RouteManager {
     }
 
     private func isIPv4Address(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 15 else {
+            return false
+        }
+
         var address = in_addr()
         return value.withCString { inet_pton(AF_INET, $0, &address) } == 1
     }

@@ -148,6 +148,7 @@ final class VPNController: NSObject {
     private var workspaceObserversInstalled = false
     private var disconnectingAfterWake = false
     private let preventSleep: Bool
+    private let privacyMode: Bool
     private let backgroundChild: Bool
     private let startupStatusFilePath: String?
     private var exitFailureMessage: String?
@@ -176,6 +177,7 @@ final class VPNController: NSObject {
         self.reachabilityProbeHosts = configuration.splitTunnel.effectiveReachabilityProbeHosts
         self.routeManager = routeManager
         self.preventSleep = preventSleep
+        self.privacyMode = configuration.privacyMode
         self.backgroundChild = backgroundChild
         self.startupStatusFilePath = startupStatusFilePath.map { URL(fileURLWithPath: $0).standardized.path }
         self.sessionState = SessionState(
@@ -233,6 +235,7 @@ final class VPNController: NSObject {
         try acquireControllerLock()
         let removedRemoteRoutes = try routeManager.prepareForConnection(using: sessionState)
         let configContent = try String(contentsOfFile: profilePath, encoding: .utf8)
+        EventLog.configure(privacyMode: privacyMode)
         EventLog.startSession(profilePath: profilePath)
         if removedRemoteRoutes > 0 {
             EventLog.append(note: "Removed \(removedRemoteRoutes) stale remote host routes before connect.",
@@ -581,6 +584,11 @@ final class VPNController: NSObject {
     }
 
     private static func isSafeIPAddress(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.count <= AppConfig.SplitTunnelConfiguration.maxIPAddressLength else {
+            return false
+        }
+
         var ipv4 = in_addr()
         var ipv6 = in6_addr()
 
@@ -589,6 +597,7 @@ final class VPNController: NSObject {
         }
     }
 
+    private static let maxUserControlledPathLength = 1024
     private static let safeNetworkServiceNameAllowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -./()_+'&")
 
     private static func isSafeNetworkServiceName(_ value: String) -> Bool {
@@ -603,6 +612,7 @@ final class VPNController: NSObject {
 
     private static func isSafeUserControlledPath(_ value: String) -> Bool {
         guard !value.isEmpty,
+              value.utf8.count <= maxUserControlledPathLength,
               value.hasPrefix("/"),
               !value.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F || (0x80...0x9F).contains($0.value) }) else {
             return false

@@ -14,7 +14,11 @@ enum ResolverPaths {
     }
 
     static func isSafeDomainFileName(_ name: String) -> Bool {
-        guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else {
+        guard !name.isEmpty,
+              name.utf8.count <= AppConfig.SplitTunnelConfiguration.maxDomainNameLength,
+              !name.contains("/"),
+              name != ".",
+              name != ".." else {
             return false
         }
         return name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }

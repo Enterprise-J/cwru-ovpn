@@ -304,7 +304,7 @@ enum CLI {
             "  status       Show the current connection status",
             "  logs         Show recent event log entries",
             "  doctor       Show diagnostic information for troubleshooting",
-            "  setup        Install sudoers rules for passwordless operation",
+            "  setup        Install the privileged binary and sudoers rules",
             "  uninstall    Remove the sudoers rule, shell shortcuts, and scoped DNS resolver files",
             "  version      Print the version number",
         ]
