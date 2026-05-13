@@ -853,7 +853,12 @@ enum SelfTest {
                                     ipv6Mode: "Automatic",
                                     activeDefaultDNSServers: ["129.22.4.32"],
                                     activeDefaultSearchDomains: ["case.edu"],
-                                    tunnelInterfaces: ["utun7"])
+                                    tunnelInterfaces: ["utun7"],
+                                    initialRoutes: [
+                                        MockSystem.RouteRecord(destination: "10.8.0.0/24",
+                                                               gateway: "10.8.0.10",
+                                                               interfaceName: "utun7")
+                                    ])
 
         try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
             try Shell.withTestHook({ try mockSystem.handle($0) }) {
@@ -863,7 +868,13 @@ enum SelfTest {
                        "Applying split tunnel should mark routesApplied.")
             try expect(session.appliedIncludedRoutes == ["129.22.0.0/16", "129.22.200.10/32"],
                        "Applying split tunnel should persist IPv4 host includes as /32 routes.")
-            try expect(session.appliedResolverDomains == ["case.edu", "10.200.22.129.in-addr.arpa", "22.129.in-addr.arpa"],
+            try expect(session.appliedResolverDomains == [
+                "case.edu",
+                "10.200.22.129.in-addr.arpa",
+                "22.129.in-addr.arpa",
+                "10.0.8.10.in-addr.arpa",
+                "0.0.8.10.in-addr.arpa"
+            ],
                        "Applying split tunnel should persist the effective resolver domains.")
 
             let resolverFile = ResolverPaths.fileURL(for: "case.edu")
@@ -1850,7 +1861,8 @@ enum SelfTest {
              blockedIPv6ProbeDestinations: Set<String> = [],
              failingRouteAdds: Set<String> = [],
              dnsCacheFlushAppliesDNSConfiguration: Bool = true,
-             hostIPv4Addresses: [String: [String]] = [:]) {
+             hostIPv4Addresses: [String: [String]] = [:],
+             initialRoutes: [RouteRecord] = []) {
             self.serviceName = serviceName
             self.defaultGateway = physicalGateway
             self.defaultInterface = physicalInterface
@@ -1868,7 +1880,7 @@ enum SelfTest {
                 RouteRecord(destination: "default",
                             gateway: physicalGateway,
                             interfaceName: physicalInterface)
-            ]
+            ] + initialRoutes
             self.ipv6DefaultRoutes = [:]
         }
 

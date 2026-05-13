@@ -147,7 +147,7 @@ struct RouteManager {
             let staleIncludedRoutes = cleanupIncludedRoutes(using: state)
             let staticIncludedRoutes = configuredIncludedRoutes()
             state.appliedIncludedRoutes = staticIncludedRoutes
-            state.appliedResolverDomains = configuration.effectiveResolverDomains(forIncludedRoutes: staticIncludedRoutes)
+            state.appliedResolverDomains = resolverDomains(forIncludedRoutes: staticIncludedRoutes, using: state)
 
             mutatedNetwork = true
             try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
@@ -168,7 +168,7 @@ struct RouteManager {
 
             let resolvedIncludedRoutes = try resolvedIncludedRoutes()
             state.appliedIncludedRoutes = resolvedIncludedRoutes
-            state.appliedResolverDomains = configuration.effectiveResolverDomains(forIncludedRoutes: resolvedIncludedRoutes)
+            state.appliedResolverDomains = resolverDomains(forIncludedRoutes: resolvedIncludedRoutes, using: state)
             try installResolverFiles(using: state)
             try flushDNS()
             try persistPreparedState?(state)
@@ -477,8 +477,41 @@ struct RouteManager {
     private func cleanupResolverDomains(using state: SessionState) -> [String] {
         let includedRoutes = cleanupIncludedRoutes(using: state)
         let candidates = state.appliedResolverDomains
-            ?? configuration.effectiveResolverDomains(forIncludedRoutes: includedRoutes)
+            ?? resolverDomains(forIncludedRoutes: includedRoutes, using: state)
         return candidates.filter {
+            AppConfig.SplitTunnelConfiguration.isValidDomainName($0)
+                && ResolverPaths.isSafeDomainFileName($0)
+        }
+    }
+
+    private func resolverDomains(forIncludedRoutes routes: [String], using state: SessionState) -> [String] {
+        uniquePreservingOrder(configuration.effectiveResolverDomains(forIncludedRoutes: routes)
+            + vpnReverseResolverZones(using: state))
+    }
+
+    private func vpnReverseResolverZones(using state: SessionState) -> [String] {
+        guard let vpnIPv4 = state.vpnIPv4,
+              let vpnHostRoute = Self.canonicalIPv4Route("\(vpnIPv4)/32") else {
+            return []
+        }
+
+        var zones = [Self.reverseResolverZone(forIPv4Address: vpnHostRoute.networkAddress)]
+        if let tunnelName = state.tunName,
+           let validatedTunnelName = try? validatedTunnelInterfaceName(tunnelName),
+           let entries = try? routingTableEntries() {
+            for entry in entries where entry.interfaceName == validatedTunnelName {
+                guard let route = Self.canonicalIPv4Route(entry.destination),
+                      route.prefixLength >= 8,
+                      route.prefixLength < 32,
+                      route.networkAddress != 0,
+                      Self.ipv4Address(vpnHostRoute.networkAddress, isIn: route) else {
+                    continue
+                }
+                zones.append(Self.reverseResolverZone(forIPv4Address: route.networkAddress))
+            }
+        }
+
+        return uniquePreservingOrder(zones).filter {
             AppConfig.SplitTunnelConfiguration.isValidDomainName($0)
                 && ResolverPaths.isSafeDomainFileName($0)
         }
@@ -1537,6 +1570,19 @@ struct RouteManager {
 
         let mask: UInt32 = prefixLength == 0 ? 0 : (~UInt32(0) << (32 - prefixLength))
         return CanonicalIPv4Route(networkAddress: address & mask, prefixLength: prefixLength)
+    }
+
+    private static func ipv4Address(_ address: UInt32, isIn route: CanonicalIPv4Route) -> Bool {
+        let mask: UInt32 = route.prefixLength == 0 ? 0 : (~UInt32(0) << (32 - route.prefixLength))
+        return (address & mask) == route.networkAddress
+    }
+
+    private static func reverseResolverZone(forIPv4Address address: UInt32) -> String {
+        let octets = (0..<4).map { index -> String in
+            let shift = 24 - (index * 8)
+            return String((address >> UInt32(shift)) & 0xFF)
+        }
+        return octets.reversed().joined(separator: ".") + ".in-addr.arpa"
     }
 
     private func parseGatewayAndInterface(_ output: String) -> (gateway: String?, interfaceName: String?) {
