@@ -1357,6 +1357,11 @@ struct RouteManager {
             return [host]
         }
 
+        return resolveIPv4AddressesWithGetaddrinfo(forHost: host)
+            .union(resolveIPv4AddressesWithDSCacheUtil(forHost: host))
+    }
+
+    private static func resolveIPv4AddressesWithGetaddrinfo(forHost host: String) -> Set<String> {
         var hints = addrinfo(
             ai_flags: AI_ADDRCONFIG,
             ai_family: AF_INET,
@@ -1391,6 +1396,34 @@ struct RouteManager {
         }
 
         return addresses
+    }
+
+    private static func resolveIPv4AddressesWithDSCacheUtil(forHost host: String) -> Set<String> {
+        guard AppConfig.SplitTunnelConfiguration.isValidDomainName(host),
+              let result = try? Shell.run("/usr/bin/dscacheutil",
+                                          arguments: ["-q", "host", "-a", "name", host],
+                                          allowNonZero: true),
+              result.exitCode == 0 else {
+            return []
+        }
+
+        return ipv4AddressesFromDSCacheUtilOutput(result.stdout)
+    }
+
+    private static func ipv4AddressesFromDSCacheUtilOutput(_ output: String) -> Set<String> {
+        Set(
+            output
+                .split(separator: "\n")
+                .compactMap { line -> String? in
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard trimmed.hasPrefix("ip_address:") else {
+                        return nil
+                    }
+                    let value = trimmed.dropFirst("ip_address:".count)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    return AppConfig.SplitTunnelConfiguration.isValidIPv4Address(value) ? value : nil
+                }
+        )
     }
 
     private func normalizeHostRouteDestination(_ destination: String) -> String? {

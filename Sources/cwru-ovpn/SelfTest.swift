@@ -38,6 +38,7 @@ enum SelfTest {
         try testPhysicalDNSCapture()
         try testPhysicalDNSCaptureRejectsUnsafeServiceName()
         try testMockedSplitTunnelFlow()
+        try testSplitTunnelUsesMacOSHostCacheResolver()
         try testSplitTunnelCleansDynamicRoutesAfterPartialFailure()
         try testSplitTunnelRejectsLeakyDefaultDNS()
         try testSplitTunnelAllowsSupplementalDefaultSearchDomains()
@@ -894,6 +895,57 @@ enum SelfTest {
                    "Applying split tunnel should verify that the active default resolver is not using VPN DNS.")
     }
 
+    private static func testSplitTunnelUsesMacOSHostCacheResolver() throws {
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-host-cache")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            includedHosts: ["cached.example"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        var session = makeSessionState(
+            pid: 1009,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    tunnelInterfaces: ["utun7"],
+                                    blockedIPv6ProbeDestinations: ["2001:4860:4860::8888", "3000::1"],
+                                    hostIPv4Addresses: ["cached.example": ["172.64.80.1"]])
+
+        try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+            try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                try RouteManager(configuration: configuration).applySplitTunnel(using: &session)
+            }
+        }
+
+        try expect(session.appliedIncludedRoutes == ["129.22.0.0/16", "172.64.80.1/32"],
+                   "Split tunnel should include IPv4 addresses returned by the macOS host cache resolver.")
+        try expect(mockSystem.recordedCommands.contains("/usr/bin/dscacheutil -q host -a name cached.example"),
+                   "Hostname includes should query the macOS host cache resolver.")
+        try expect(mockSystem.recordedCommands.contains("/sbin/route -n add -net 172.64.80.1/32 -interface utun7"),
+                   "Split tunnel should add routes learned from the macOS host cache resolver.")
+    }
+
     private static func testPhysicalDNSCapture() throws {
         let configuration = AppConfig.SplitTunnelConfiguration(
             includedRoutes: ["129.22.0.0/16"],
@@ -1394,6 +1446,22 @@ enum SelfTest {
             throw SelfTestError.failed("Mode switch waits should not keep waiting after a failed in-place switch.")
         }
 
+        var refreshFailedSession = failedSession
+        refreshFailedSession.tunnelMode = .split
+        refreshFailedSession.lastEvent = "MODE_SWITCH_FAILED"
+        refreshFailedSession.lastInfo = "Split-tunnel refresh failed: Invalid configuration"
+
+        switch VPNController.evaluateModeSwitchWaitState(session: refreshFailedSession,
+                                                         pid: refreshFailedSession.pid,
+                                                         targetMode: .split,
+                                                         sawRequestedMode: true) {
+        case .failed(let message):
+            try expect(message == "Split-tunnel refresh failed: Invalid configuration",
+                       "Same-mode split refresh waits should surface persisted refresh failures.")
+        default:
+            throw SelfTestError.failed("Same-mode split refresh waits should not report success after a failed refresh.")
+        }
+
         var completedSession = failedSession
         completedSession.tunnelMode = .full
         completedSession.lastInfo = nil
@@ -1448,6 +1516,17 @@ enum SelfTest {
                                                                  persistedState: persistedSession)
         try expect(preservedSession.requestedTunnelMode == .full,
                    "Routine controller saves should preserve a pending CLI mode switch until the signal handler consumes it.")
+
+        var persistedRefreshSession = currentSession
+        persistedRefreshSession.requestedTunnelMode = .split
+        persistedRefreshSession.requestedConfigurationRefresh = true
+
+        let preservedRefreshSession = VPNController.sessionStateForSave(currentState: currentSession,
+                                                                        persistedState: persistedRefreshSession)
+        try expect(preservedRefreshSession.requestedTunnelMode == .split,
+                   "Routine controller saves should preserve a pending split-tunnel refresh request.")
+        try expect(preservedRefreshSession.requestedConfigurationRefresh == true,
+                   "Routine controller saves should preserve the pending split-tunnel refresh marker.")
 
         let intentionallyClearedSession = VPNController.sessionStateForSave(currentState: currentSession,
                                                                             persistedState: persistedSession,
@@ -1753,6 +1832,7 @@ enum SelfTest {
         private let blockedIPv6ProbeDestinations: Set<String>
         private let failingRouteAdds: Set<String>
         private let dnsCacheFlushAppliesDNSConfiguration: Bool
+        private let hostIPv4Addresses: [String: [String]]
         private var routes: [RouteRecord]
         private var ipv6DefaultRoutes: [String: String]
 
@@ -1769,7 +1849,8 @@ enum SelfTest {
              tunnelInterfaces: Set<String>,
              blockedIPv6ProbeDestinations: Set<String> = [],
              failingRouteAdds: Set<String> = [],
-             dnsCacheFlushAppliesDNSConfiguration: Bool = true) {
+             dnsCacheFlushAppliesDNSConfiguration: Bool = true,
+             hostIPv4Addresses: [String: [String]] = [:]) {
             self.serviceName = serviceName
             self.defaultGateway = physicalGateway
             self.defaultInterface = physicalInterface
@@ -1782,6 +1863,7 @@ enum SelfTest {
             self.blockedIPv6ProbeDestinations = blockedIPv6ProbeDestinations
             self.failingRouteAdds = failingRouteAdds
             self.dnsCacheFlushAppliesDNSConfiguration = dnsCacheFlushAppliesDNSConfiguration
+            self.hostIPv4Addresses = hostIPv4Addresses
             self.routes = [
                 RouteRecord(destination: "default",
                             gateway: physicalGateway,
@@ -1802,7 +1884,9 @@ enum SelfTest {
                 return handleNetworkSetup(arguments: invocation.arguments)
             case "/usr/sbin/scutil":
                 return handleScutil(arguments: invocation.arguments)
-            case "/usr/bin/dscacheutil", "/usr/bin/killall":
+            case "/usr/bin/dscacheutil":
+                return handleDSCacheUtil(arguments: invocation.arguments)
+            case "/usr/bin/killall":
                 if dnsCacheFlushAppliesDNSConfiguration {
                     activeDefaultDNSServers = dnsServers
                     activeDefaultSearchDomains = searchDomains
@@ -1847,6 +1931,31 @@ enum SelfTest {
             }
 
             throw SelfTestError.failed("Unexpected shell command in mocked integration test: \(([invocation.launchPath] + invocation.arguments).joined(separator: " "))")
+        }
+
+        private func handleDSCacheUtil(arguments: [String]) -> ShellResult {
+            if arguments == ["-flushcache"] {
+                if dnsCacheFlushAppliesDNSConfiguration {
+                    activeDefaultDNSServers = dnsServers
+                    activeDefaultSearchDomains = searchDomains
+                }
+                return ShellResult(exitCode: 0, stdout: "", stderr: "")
+            }
+
+            if arguments.count == 5,
+               arguments[0] == "-q",
+               arguments[1] == "host",
+               arguments[2] == "-a",
+               arguments[3] == "name" {
+                let host = arguments[4]
+                let records = (hostIPv4Addresses[host] ?? [])
+                    .map { "name: \(host)\nip_address: \($0)" }
+                return ShellResult(exitCode: 0,
+                                   stdout: records.joined(separator: "\n\n") + (records.isEmpty ? "" : "\n"),
+                                   stderr: "")
+            }
+
+            return ShellResult(exitCode: 1, stdout: "", stderr: "unsupported dscacheutil command")
         }
 
         private func handleRoute(arguments: [String]) -> ShellResult {

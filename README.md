@@ -2,7 +2,7 @@
 
 Native macOS client for Case Western Reserve University OpenVPN profiles, built on OpenVPN 3.
 
-- Version: `0.5.0`
+- Version: `0.5.1`
 - Requires: Apple Silicon and macOS 14 or later for prebuilt installs
 - Modes: full tunnel and split tunnel, switchable while connected
 - Scope: no launch daemon and no login item
@@ -36,7 +36,7 @@ Prebuilt installs are Apple Silicon only. Intel Macs must run a local release bu
 | --- | --- |
 | `ovpn` | Connect using the default mode from `config.json` |
 | `ovpnfull` | Connect or switch to full tunnel |
-| `ovpnsplit` | Connect or switch to split tunnel |
+| `ovpnsplit` | Connect, switch to, or refresh split tunnel |
 | `ovpnstatus` | Print status |
 | `ovpnd` | Disconnect |
 

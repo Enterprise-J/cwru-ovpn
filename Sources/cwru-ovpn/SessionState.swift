@@ -33,6 +33,7 @@ struct SessionState: Codable {
     var serverIP: String?
     var tunnelMode: AppTunnelMode?
     var requestedTunnelMode: AppTunnelMode?
+    var requestedConfigurationRefresh: Bool? = nil
     var fullTunnelDefaultRoutes: [ManagedIPv4Route]?
     var fullTunnelDNSServers: [String]?
     var fullTunnelSearchDomains: [String]?

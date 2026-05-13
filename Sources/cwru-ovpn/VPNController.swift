@@ -122,8 +122,8 @@ final class VPNController: NSObject {
     private let ssoMethods: String
     private let verbosity: AppVerbosity
     private var tunnelMode: AppTunnelMode
-    private let reachabilityProbeHosts: [String]
-    private let routeManager: RouteManager
+    private var reachabilityProbeHosts: [String]
+    private var routeManager: RouteManager
     private var menuBarController: MenuBarController?
     private var sessionState: SessionState
     private var client: OpaquePointer?
@@ -362,6 +362,18 @@ final class VPNController: NSObject {
         case .connected:
             let activeMode = session.tunnelMode ?? targetMode
             if activeMode == targetMode {
+                if activeMode == .split {
+                    session.requestedTunnelMode = targetMode
+                    session.requestedConfigurationRefresh = true
+                    try session.save()
+                    _ = try signalValidatedProcess(pid: session.pid,
+                                                   expectedExecutablePath: expectedExecutablePath,
+                                                   expectedStartTime: session.processStartTime,
+                                                   signal: SIGUSR1)
+                    try waitForModeSwitch(pid: session.pid, targetMode: targetMode)
+                    print("Refreshed split-tunnel configuration.")
+                    return true
+                }
                 print("Already connected in \(activeMode.modeDescription) mode.")
                 return true
             }
@@ -461,6 +473,13 @@ final class VPNController: NSObject {
         }
 
         if session.phase == .failed {
+            return .failed(session.lastInfo ?? "Mode switch failed.")
+        }
+
+        if sawRequestedMode,
+           session.phase == .connected,
+           session.requestedTunnelMode == nil,
+           session.lastEvent == "MODE_SWITCH_FAILED" {
             return .failed(session.lastInfo ?? "Mode switch failed.")
         }
 
@@ -685,7 +704,9 @@ final class VPNController: NSObject {
         }
         print("Profile: \(session.profilePath)")
         print("Started: \(ISO8601DateFormatter().string(from: session.startedAt))")
-        if alive, let requestedTunnelMode = session.requestedTunnelMode {
+        if alive, session.requestedConfigurationRefresh == true {
+            print("Pending split-tunnel refresh")
+        } else if alive, let requestedTunnelMode = session.requestedTunnelMode {
             print("Pending mode switch: \(requestedTunnelMode.displayName)")
         }
         if let detail = recoveryDetail(for: session, stale: !alive), !detail.isEmpty {
@@ -826,6 +847,7 @@ final class VPNController: NSObject {
 
         if tunnelMode == .split {
             do {
+                try reloadSplitTunnelConfiguration()
                 try routeManager.applySplitTunnel(using: &connectedState) { [self] preparedState in
                     sessionState = preparedState
                     try saveState()
@@ -1189,38 +1211,62 @@ final class VPNController: NSObject {
     private func applyPendingModeSwitchIfNeeded(trigger: String) throws {
         guard sessionState.phase == .connected,
               let persistedState = SessionState.load(),
-              persistedState.pid == sessionState.pid,
-              let requestedMode = persistedState.requestedTunnelMode else {
+              persistedState.pid == sessionState.pid else {
             return
         }
 
-        try applyModeSwitch(to: requestedMode, trigger: trigger)
+        let refreshCurrentMode = persistedState.requestedConfigurationRefresh == true
+        if let requestedMode = persistedState.requestedTunnelMode {
+            try applyModeSwitch(to: requestedMode,
+                                trigger: trigger,
+                                refreshCurrentMode: refreshCurrentMode)
+        } else if refreshCurrentMode, tunnelMode == .split {
+            try applyModeSwitch(to: .split,
+                                trigger: trigger,
+                                refreshCurrentMode: true)
+        }
     }
 
     @MainActor
-    private func applyModeSwitch(to requestedMode: AppTunnelMode, trigger: String) throws {
+    private func applyModeSwitch(to requestedMode: AppTunnelMode,
+                                 trigger: String,
+                                 refreshCurrentMode: Bool = false) throws {
         guard sessionState.phase == .connected else {
             return
         }
 
         if requestedMode == tunnelMode {
-            sessionState.requestedTunnelMode = nil
-            try saveState(preservingPendingModeSwitch: false)
-            updateMenuBar()
-            return
+            guard requestedMode == .split, refreshCurrentMode else {
+                sessionState.requestedTunnelMode = nil
+                sessionState.requestedConfigurationRefresh = nil
+                try saveState(preservingPendingModeSwitch: false)
+                updateMenuBar()
+                return
+            }
         }
 
-        emit("Switching to \(requestedMode.modeDescription) mode.")
-        EventLog.append(note: "Applying in-place mode switch to \(requestedMode.modeDescription) (trigger: \(trigger)).",
-                        phase: sessionState.phase)
+        let refreshingSplitTunnel = requestedMode == tunnelMode && refreshCurrentMode
+        if refreshingSplitTunnel {
+            emit("Refreshing split-tunnel configuration.")
+            EventLog.append(note: "Refreshing split-tunnel configuration (trigger: \(trigger)).",
+                            phase: sessionState.phase)
+        } else {
+            emit("Switching to \(requestedMode.modeDescription) mode.")
+            EventLog.append(note: "Applying in-place mode switch to \(requestedMode.modeDescription) (trigger: \(trigger)).",
+                            phase: sessionState.phase)
+        }
 
         let previousMode = tunnelMode
+        let previousRouteManager = routeManager
+        let previousReachabilityProbeHosts = reachabilityProbeHosts
         var updatedState = sessionState
         updatedState.requestedTunnelMode = requestedMode
+        updatedState.requestedConfigurationRefresh = refreshingSplitTunnel ? true : nil
 
         do {
             switch requestedMode {
             case .split:
+                try reloadSplitTunnelConfiguration()
                 try routeManager.applySplitTunnel(using: &updatedState) { [self] preparedState in
                     sessionState = preparedState
                     try saveState()
@@ -1230,10 +1276,15 @@ final class VPNController: NSObject {
                                                     fullTunnelRoutes: updatedState.fullTunnelDefaultRoutes ?? [])
             }
         } catch {
+            routeManager = previousRouteManager
+            reachabilityProbeHosts = previousReachabilityProbeHosts
             var rollbackState = sessionState
             rollbackState.requestedTunnelMode = nil
+            rollbackState.requestedConfigurationRefresh = nil
             rollbackState.lastEvent = "MODE_SWITCH_FAILED"
-            rollbackState.lastInfo = "Mode switch to \(requestedMode.modeDescription) failed: \(error.localizedDescription)"
+            rollbackState.lastInfo = refreshingSplitTunnel
+                ? "Split-tunnel refresh failed: \(error.localizedDescription)"
+                : "Mode switch to \(requestedMode.modeDescription) failed: \(error.localizedDescription)"
             if previousMode == .split {
                 _ = try? routeManager.applySplitTunnel(using: &rollbackState) { [self] preparedState in
                     sessionState = preparedState
@@ -1254,6 +1305,7 @@ final class VPNController: NSObject {
         tunnelMode = requestedMode
         updatedState.tunnelMode = requestedMode
         updatedState.requestedTunnelMode = nil
+        updatedState.requestedConfigurationRefresh = nil
         updatedState.lastEvent = "MODE_SWITCHED"
         updatedState.lastInfo = nil
         sessionState = updatedState
@@ -1269,9 +1321,22 @@ final class VPNController: NSObject {
         try saveState(preservingPendingModeSwitch: false)
         updateMenuBar()
 
-        EventLog.append(note: "Mode switched to \(requestedMode.modeDescription).",
-                        phase: sessionState.phase)
-        emit("Mode switched to \(requestedMode.modeDescription) mode.")
+        if refreshingSplitTunnel {
+            EventLog.append(note: "Split-tunnel configuration refreshed.",
+                            phase: sessionState.phase)
+            emit("Split-tunnel configuration refreshed.")
+        } else {
+            EventLog.append(note: "Mode switched to \(requestedMode.modeDescription).",
+                            phase: sessionState.phase)
+            emit("Mode switched to \(requestedMode.modeDescription) mode.")
+        }
+    }
+
+    @MainActor
+    private func reloadSplitTunnelConfiguration() throws {
+        let configuration = try AppConfig.load(explicitConfigPath: configFilePath)
+        routeManager = RouteManager(configuration: configuration.splitTunnel)
+        reachabilityProbeHosts = configuration.splitTunnel.effectiveReachabilityProbeHosts
     }
 
     @MainActor
@@ -1348,12 +1413,15 @@ final class VPNController: NSObject {
               persistedState.executablePath == currentState.executablePath,
               persistedState.processStartTime == currentState.processStartTime,
               let pendingMode = persistedState.requestedTunnelMode,
-              currentState.phase != .connected || pendingMode != currentState.tunnelMode else {
+              currentState.phase != .connected
+                || persistedState.requestedConfigurationRefresh == true
+                || pendingMode != currentState.tunnelMode else {
             return currentState
         }
 
         var mergedState = currentState
         mergedState.requestedTunnelMode = pendingMode
+        mergedState.requestedConfigurationRefresh = persistedState.requestedConfigurationRefresh
         return mergedState
     }
 
