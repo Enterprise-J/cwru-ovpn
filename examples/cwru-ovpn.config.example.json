@@ -8,6 +8,10 @@
     "includedRoutes": [
       "129.22.0.0/16"
     ],
+    "includedHosts": [
+      "vpn.case.edu",
+      "129.22.200.10"
+    ],
     "reachabilityProbeHosts": [
       "1.1.1.1",
       "8.8.8.8",

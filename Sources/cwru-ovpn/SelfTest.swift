@@ -20,6 +20,7 @@ enum SelfTest {
         try testPreventSleepConfig()
         try testLegacyConfigKeys()
         try testLenientSplitTunnelDecoding()
+        try testIncludedHostsConfig()
         try testMissingConfigErrors()
         try testRuntimeValidationHardening()
         try testWebAuthRequestValidation()
@@ -37,9 +38,11 @@ enum SelfTest {
         try testPhysicalDNSCapture()
         try testPhysicalDNSCaptureRejectsUnsafeServiceName()
         try testMockedSplitTunnelFlow()
+        try testSplitTunnelCleansDynamicRoutesAfterPartialFailure()
         try testSplitTunnelRejectsLeakyDefaultDNS()
         try testSplitTunnelAllowsSupplementalDefaultSearchDomains()
         try testMockedFullTunnelModeSwitch()
+        try testMockedSplitFullSplitModeSwitchWithIncludedHosts()
         try testMockedFullTunnelDNSFallsBackToPushedResolvers()
         try testFullTunnelIPv6SafetyFailureThrows()
         try testModeSwitchWaitState()
@@ -180,10 +183,49 @@ enum SelfTest {
         let decoded = try JSONDecoder().decode(AppConfig.self, from: emptySplitTunnelData)
         try expect(decoded.splitTunnel.includedRoutes.isEmpty,
                    "splitTunnel.includedRoutes should default to an empty array when omitted.")
+        try expect(decoded.splitTunnel.includedHosts.isEmpty,
+                   "splitTunnel.includedHosts should default to an empty array when omitted.")
         try expect(decoded.splitTunnel.resolverDomains.isEmpty,
                    "splitTunnel.resolverDomains should default to an empty array when omitted.")
         try expect(decoded.splitTunnel.resolverNameServers.isEmpty,
                    "splitTunnel.resolverNameServers should default to an empty array when omitted.")
+    }
+
+    private static func testIncludedHostsConfig() throws {
+        let data = Data(
+            """
+            {
+              "splitTunnel": {
+                "includedRoutes": ["129.22.0.0/16"],
+                "includedHosts": ["129.22.1.10", "vpn.case.edu"],
+                "resolverDomains": ["case.edu"],
+                "resolverNameServers": []
+              }
+            }
+            """.utf8
+        )
+
+        let decoded = try JSONDecoder().decode(AppConfig.self, from: data)
+        try expect(decoded.splitTunnel.includedHosts == ["129.22.1.10", "vpn.case.edu"],
+                   "includedHosts should decode from config.")
+        try expect(decoded.splitTunnel.effectiveIncludedRoutes == ["129.22.0.0/16", "129.22.1.10/32"],
+                   "IPv4 includedHosts should expand to /32 split-tunnel routes.")
+        try expect(decoded.splitTunnel.includedHostDomains == ["vpn.case.edu"],
+                   "Domain includedHosts should remain available for scoped DNS.")
+        try expect(decoded.splitTunnel.effectiveResolverDomains.contains("vpn.case.edu"),
+                   "Domain includedHosts should be included in scoped resolver domains.")
+        try expect(decoded.splitTunnel.effectiveResolverDomains.contains("10.1.22.129.in-addr.arpa"),
+                   "IPv4 includedHosts should derive reverse resolver zones.")
+
+        let invalidHost = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: [],
+            includedHosts: ["2001:db8::1"],
+            resolverDomains: [],
+            resolverNameServers: [],
+            reachabilityProbeHosts: nil
+        )
+        try expect(invalidHost.validationError()?.contains("includedHost") == true,
+                   "includedHosts should reject IPv6 because split-tunnel host routing is IPv4-only.")
     }
 
     private static func testMissingConfigErrors() throws {
@@ -447,6 +489,10 @@ enum SelfTest {
                    "IPv4 addresses should validate.")
         try expect(!AppConfig.SplitTunnelConfiguration.isValidIPAddress("1.1.1.1\nnameserver 8.8.8.8"),
                    "Injected multiline DNS payloads should be rejected.")
+        try expect(AppConfig.SplitTunnelConfiguration.isValidIPv4Address("1.1.1.1"),
+                   "IPv4-only split-tunnel host addresses should validate.")
+        try expect(!AppConfig.SplitTunnelConfiguration.isValidIPv4Address("2001:db8::1"),
+                   "IPv6 addresses should not validate as split-tunnel included hosts.")
         try expect(AppConfig.SplitTunnelConfiguration.isValidDomainName("case.edu"),
                    "Expected resolver domains should validate.")
         try expect(!AppConfig.SplitTunnelConfiguration.isValidDomainName("case.edu/../../etc"),
@@ -775,6 +821,7 @@ enum SelfTest {
 
         let configuration = AppConfig.SplitTunnelConfiguration(
             includedRoutes: ["129.22.0.0/16"],
+            includedHosts: ["129.22.200.10"],
             resolverDomains: ["case.edu"],
             resolverNameServers: ["129.22.4.32"],
             reachabilityProbeHosts: nil
@@ -813,16 +860,21 @@ enum SelfTest {
             }
             try expect(session.routesApplied,
                        "Applying split tunnel should mark routesApplied.")
-            try expect(session.appliedResolverDomains == ["case.edu", "22.129.in-addr.arpa"],
+            try expect(session.appliedIncludedRoutes == ["129.22.0.0/16", "129.22.200.10/32"],
+                       "Applying split tunnel should persist IPv4 host includes as /32 routes.")
+            try expect(session.appliedResolverDomains == ["case.edu", "10.200.22.129.in-addr.arpa", "22.129.in-addr.arpa"],
                        "Applying split tunnel should persist the effective resolver domains.")
 
             let resolverFile = ResolverPaths.fileURL(for: "case.edu")
             let reverseResolverFile = ResolverPaths.fileURL(for: "22.129.in-addr.arpa")
+            let hostReverseResolverFile = ResolverPaths.fileURL(for: "10.200.22.129.in-addr.arpa")
             let resolverContents = try String(contentsOf: resolverFile, encoding: .utf8)
             try expect(resolverContents.contains("nameserver 129.22.4.32"),
                        "Applying split tunnel should install scoped resolver files with VPN DNS servers.")
             try expect(FileManager.default.fileExists(atPath: reverseResolverFile.path),
                        "Applying split tunnel should install reverse-zone resolver files for included routes.")
+            try expect(FileManager.default.fileExists(atPath: hostReverseResolverFile.path),
+                       "Applying split tunnel should install reverse-zone resolver files for included host routes.")
             try expect(mockSystem.recordedCommands.contains("/usr/sbin/chown root:wheel \(resolverFile.path)"),
                        "Applying split tunnel should enforce root:wheel ownership on resolver files.")
             try expect(mockSystem.recordedCommands.contains("/bin/chmod 0644 \(resolverFile.path)"),
@@ -836,6 +888,8 @@ enum SelfTest {
                    "Applying split tunnel should add the lower-half default route override.")
         try expect(mockSystem.recordedCommands.contains("/sbin/route -n add -net 129.22.0.0/16 -interface utun7"),
                    "Applying split tunnel should route included CIDRs through the tunnel interface.")
+        try expect(mockSystem.recordedCommands.contains("/sbin/route -n add -net 129.22.200.10/32 -interface utun7"),
+                   "Applying split tunnel should route included IPv4 hosts through the tunnel interface.")
         try expect(mockSystem.recordedCommands.contains("/usr/sbin/scutil --dns"),
                    "Applying split tunnel should verify that the active default resolver is not using VPN DNS.")
     }
@@ -892,6 +946,82 @@ enum SelfTest {
         }
         try expect(!mockSystem.recordedCommands.contains { $0.contains("-getdnsservers") },
                    "Unsafe network service names should not be passed to networksetup DNS commands.")
+    }
+
+    private static func testSplitTunnelCleansDynamicRoutesAfterPartialFailure() throws {
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-partial-route-failure")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            includedHosts: ["app.case.edu"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        var session = makeSessionState(
+            pid: 1007,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        session.pushedDNSServers = ["129.22.4.32"]
+        session.pushedSearchDomains = ["case.edu"]
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    tunnelInterfaces: ["utun7"],
+                                    failingRouteAdds: ["129.22.200.11/32"])
+        var preparedStateWasPersistable = false
+        var preparedIncludedRoutes: [String]?
+        var dynamicRouteAlreadyAddedBeforePreparedState = false
+
+        try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+            do {
+                try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                    try RouteManager(
+                        configuration: configuration,
+                        ipv4Resolver: { host in host == "app.case.edu" ? ["129.22.200.10", "129.22.200.11"] : [] }
+                    ).applySplitTunnel(using: &session) { preparedState in
+                        preparedStateWasPersistable = true
+                        preparedIncludedRoutes = preparedState.appliedIncludedRoutes
+                        dynamicRouteAlreadyAddedBeforePreparedState = mockSystem.recordedCommands.contains(
+                            "/sbin/route -n add -net 129.22.200.10/32 -interface utun7"
+                        )
+                    }
+                }
+                throw SelfTestError.failed("Split tunnel should fail when one resolved host route cannot be added.")
+            } catch {
+                try expect(preparedStateWasPersistable,
+                           "Split tunnel should expose resolved host routes for persistence before adding them.")
+                try expect(preparedIncludedRoutes == [
+                    "129.22.0.0/16",
+                    "129.22.200.10/32",
+                    "129.22.200.11/32",
+                ], "Prepared split-tunnel state should include all resolved host routes before dynamic route mutation.")
+                try expect(!dynamicRouteAlreadyAddedBeforePreparedState,
+                           "Prepared split-tunnel state should be persisted before adding resolved host routes.")
+                try expect(!session.routesApplied,
+                           "Split tunnel should leave routesApplied false after a partial resolved-route failure.")
+                try expect(mockSystem.recordedCommands.contains("/sbin/route -n delete -net 129.22.200.10/32"),
+                           "Split tunnel cleanup should delete resolved host routes that were added before failure.")
+                try expect(mockSystem.recordedCommands.contains("/sbin/route -n delete -net 129.22.200.11/32"),
+                           "Split tunnel cleanup should attempt to delete all prepared resolved host routes.")
+            }
+        }
     }
 
     private static func testSplitTunnelRejectsLeakyDefaultDNS() throws {
@@ -1057,6 +1187,75 @@ enum SelfTest {
             try expect(mockSystem.recordedCommands.contains("/sbin/route -n get -inet6 2001:4860:4860::8888"),
                        "Switching to full tunnel should validate that public IPv6 no longer leaves through the physical interface.")
         }
+    }
+
+    private static func testMockedSplitFullSplitModeSwitchWithIncludedHosts() throws {
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-split-full-split")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            includedHosts: ["app.case.edu"],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        var session = makeSessionState(
+            pid: 1008,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        session.pushedDNSServers = ["129.22.4.32"]
+        session.pushedSearchDomains = ["case.edu"]
+        session.fullTunnelDNSServers = ["10.8.0.2"]
+        session.fullTunnelSearchDomains = ["case.edu"]
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    tunnelInterfaces: ["utun7"],
+                                    blockedIPv6ProbeDestinations: ["2001:4860:4860::8888", "3000::1"])
+        let manager = RouteManager(
+            configuration: configuration,
+            ipv4Resolver: { host in host == "app.case.edu" ? ["129.22.200.10"] : [] }
+        )
+        let fullTunnelRoutes = [
+            ManagedIPv4Route(destination: "0.0.0.0/1", nextHopKind: .interface, nextHopValue: "utun7"),
+            ManagedIPv4Route(destination: "128.0.0.0/1", nextHopKind: .interface, nextHopValue: "utun7"),
+        ]
+
+        try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+            try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                try manager.applySplitTunnel(using: &session)
+                try manager.switchToFullTunnel(using: &session,
+                                               fullTunnelRoutes: fullTunnelRoutes)
+                try manager.applySplitTunnel(using: &session)
+            }
+        }
+
+        let dynamicAdd = "/sbin/route -n add -net 129.22.200.10/32 -interface utun7"
+        let dynamicDelete = "/sbin/route -n delete -net 129.22.200.10/32"
+        try expect(mockSystem.recordedCommands.filter { $0 == dynamicAdd }.count == 2,
+                   "Split-full-split mode switches should add resolved host routes each time split tunnel is applied.")
+        try expect(mockSystem.recordedCommands.filter { $0 == dynamicDelete }.count >= 2,
+                   "Switching away from split tunnel and back should delete stale resolved host routes.")
+        try expect(session.appliedIncludedRoutes == ["129.22.0.0/16", "129.22.200.10/32"],
+                   "Returning to split tunnel should preserve the current resolved host route set.")
+        try expect(session.routesApplied,
+                   "Returning to split tunnel should mark split routes as applied.")
     }
 
     private static func testMockedFullTunnelDNSFallsBackToPushedResolvers() throws {
@@ -1552,6 +1751,7 @@ enum SelfTest {
         private var ipv6Mode: String
         private let tunnelInterfaces: Set<String>
         private let blockedIPv6ProbeDestinations: Set<String>
+        private let failingRouteAdds: Set<String>
         private let dnsCacheFlushAppliesDNSConfiguration: Bool
         private var routes: [RouteRecord]
         private var ipv6DefaultRoutes: [String: String]
@@ -1568,6 +1768,7 @@ enum SelfTest {
              activeDefaultSearchDomains: [String]? = nil,
              tunnelInterfaces: Set<String>,
              blockedIPv6ProbeDestinations: Set<String> = [],
+             failingRouteAdds: Set<String> = [],
              dnsCacheFlushAppliesDNSConfiguration: Bool = true) {
             self.serviceName = serviceName
             self.defaultGateway = physicalGateway
@@ -1579,6 +1780,7 @@ enum SelfTest {
             self.ipv6Mode = ipv6Mode
             self.tunnelInterfaces = tunnelInterfaces
             self.blockedIPv6ProbeDestinations = blockedIPv6ProbeDestinations
+            self.failingRouteAdds = failingRouteAdds
             self.dnsCacheFlushAppliesDNSConfiguration = dnsCacheFlushAppliesDNSConfiguration
             self.routes = [
                 RouteRecord(destination: "default",
@@ -1691,6 +1893,9 @@ enum SelfTest {
 
                 if arguments[2] == "-net", arguments.count >= 4 {
                     let destination = arguments[3]
+                    if failingRouteAdds.contains(destination) {
+                        return ShellResult(exitCode: 1, stdout: "", stderr: "mock route add failure")
+                    }
                     if let interfaceIndex = arguments.firstIndex(of: "-interface"),
                        interfaceIndex + 1 < arguments.count {
                         upsertRoute(destination: destination,

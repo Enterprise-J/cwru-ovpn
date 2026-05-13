@@ -29,6 +29,7 @@ fi
 OPENSSL_ARCHIVE="$(brew --cache --build-from-source openssl@3)"
 LZ4_ARCHIVE="$(brew --cache --build-from-source lz4)"
 FMT_ARCHIVE="$(brew --cache --build-from-source fmt)"
+OPENSSL_MKINSTALLVARS_PATCH="${ROOT}/scripts/patches/openssl-3.6.2-mkinstallvars-no-debug.patch"
 
 require_archive() {
   local archive_path="$1"
@@ -67,6 +68,11 @@ first_directory_child() {
   find "${parent}" -mindepth 1 -maxdepth 1 -type d | head -n 1
 }
 
+patch_checksum() {
+  local patch_path="$1"
+  shasum -a 256 "${patch_path}" | awk '{print $1}'
+}
+
 build_metadata() {
   local deployment_target="$1"
 
@@ -74,6 +80,7 @@ build_metadata() {
 deployment_target=${deployment_target}
 arch=$(uname -m)
 openssl_archive=$(basename "${OPENSSL_ARCHIVE}")
+openssl_mkinstallvars_patch=$(patch_checksum "${OPENSSL_MKINSTALLVARS_PATCH}")
 lz4_archive=$(basename "${LZ4_ARCHIVE}")
 fmt_archive=$(basename "${FMT_ARCHIVE}")
 EOF
@@ -106,6 +113,7 @@ build_openssl() {
   extract_archive "${OPENSSL_ARCHIVE}" "${source_root}"
   local source_dir
   source_dir="$(first_directory_child "${source_root}")"
+  patch -d "${source_dir}" -p1 < "${OPENSSL_MKINSTALLVARS_PATCH}"
 
   pushd "${source_dir}" >/dev/null
   env \
@@ -167,6 +175,7 @@ build_fmt() {
   source_dir="$(first_directory_child "${source_root}")"
 
   cmake -S "${source_dir}" -B "${build_dir}" \
+    --log-level=NOTICE \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${prefix}" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="${deployment_target}" \

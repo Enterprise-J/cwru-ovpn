@@ -21,7 +21,9 @@ sign_release_binary() {
   local output_path="$1"
 
   if [[ -z "${CODESIGN_IDENTITY}" ]]; then
-    echo "Warning: ${output_path} is not Developer ID signed; set CWRU_OVPN_CODESIGN_IDENTITY to sign release binaries." >&2
+    codesign --force --options runtime --sign - "${output_path}"
+    codesign --verify --deep --strict --verbose=2 "${output_path}"
+    echo "Ad-hoc signed ${output_path}; set CWRU_OVPN_CODESIGN_IDENTITY for Developer ID release signing."
     return
   fi
 

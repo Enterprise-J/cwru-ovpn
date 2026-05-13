@@ -53,6 +53,7 @@ enum RouteManagerError: LocalizedError {
     case failedToRestoreFullTunnelRoutes
     case failedToRestoreFullTunnelIPv6Routes
     case failedToIsolateSplitTunnelDNS
+    case failedToResolveIncludedHost(String)
     case invalidTunnelInterface
 
     var errorDescription: String? {
@@ -65,6 +66,8 @@ enum RouteManagerError: LocalizedError {
             return "Failed to secure full-tunnel IPv6 traffic."
         case .failedToIsolateSplitTunnelDNS:
             return "Split-tunnel DNS isolation could not be enforced."
+        case .failedToResolveIncludedHost(let host):
+            return "Could not resolve split-tunnel included host '\(host)' to an IPv4 address."
         case .invalidTunnelInterface:
             return "Encountered an unexpected tunnel interface name."
         }
@@ -73,6 +76,13 @@ enum RouteManagerError: LocalizedError {
 
 struct RouteManager {
     let configuration: AppConfig.SplitTunnelConfiguration
+    private let ipv4Resolver: (String) -> Set<String>
+
+    init(configuration: AppConfig.SplitTunnelConfiguration,
+         ipv4Resolver: @escaping (String) -> Set<String> = RouteManager.defaultResolveIPv4Addresses(forHost:)) {
+        self.configuration = configuration
+        self.ipv4Resolver = ipv4Resolver
+    }
 
     func detectPhysicalNetwork() throws -> PhysicalNetwork {
         let defaultRoute = try Shell.run("/sbin/route", arguments: ["-n", "get", "default"], allowNonZero: true)
@@ -123,7 +133,8 @@ struct RouteManager {
                                         ipv6Mode: try ipv6Mode(forServiceNamed: serviceName))
     }
 
-    func applySplitTunnel(using state: inout SessionState) throws {
+    func applySplitTunnel(using state: inout SessionState,
+                          persistPreparedState: ((SessionState) throws -> Void)? = nil) throws {
         guard let gateway = state.physicalGateway,
               let tunnelName = state.tunName else {
             return
@@ -133,15 +144,20 @@ struct RouteManager {
         var mutatedNetwork = false
 
         do {
+            let staleIncludedRoutes = cleanupIncludedRoutes(using: state)
+            let staticIncludedRoutes = configuredIncludedRoutes()
+            state.appliedIncludedRoutes = staticIncludedRoutes
+            state.appliedResolverDomains = configuration.effectiveResolverDomains(forIncludedRoutes: staticIncludedRoutes)
+
             mutatedNetwork = true
             try removeOpenVPNDefaultRoutes(tunnelName: validatedTunnelName)
-            for route in cleanupIncludedRoutes(using: state) {
+            for route in staleIncludedRoutes {
                 try deleteIPv4NetRoute(route, allowNonZero: true)
             }
 
             try addIPv4NetRoute("0.0.0.0/1", gateway: gateway, allowNonZero: false)
             try addIPv4NetRoute("128.0.0.0/1", gateway: gateway, allowNonZero: false)
-            for route in cleanupIncludedRoutes(using: state) {
+            for route in staticIncludedRoutes {
                 try addIPv4NetRoute(route, interfaceName: validatedTunnelName, allowNonZero: false)
             }
 
@@ -149,11 +165,23 @@ struct RouteManager {
             try installResolverFiles(using: state)
             try restoreDNSConfiguration(using: state)
             try flushDNS()
+
+            let resolvedIncludedRoutes = try resolvedIncludedRoutes()
+            state.appliedIncludedRoutes = resolvedIncludedRoutes
+            state.appliedResolverDomains = configuration.effectiveResolverDomains(forIncludedRoutes: resolvedIncludedRoutes)
+            try installResolverFiles(using: state)
+            try flushDNS()
+            try persistPreparedState?(state)
+
+            let staticRouteSet = Set(staticIncludedRoutes)
+            for route in resolvedIncludedRoutes where !staticRouteSet.contains(route) {
+                try addIPv4NetRoute(route, interfaceName: validatedTunnelName, allowNonZero: false)
+            }
+
             if try validateSplitTunnelPrivacy(using: state) {
                 try flushDNS()
             }
 
-            state.appliedIncludedRoutes = cleanupIncludedRoutes(using: state)
             state.appliedResolverDomains = cleanupResolverDomains(using: state)
             state.routesApplied = true
         } catch {
@@ -442,16 +470,48 @@ struct RouteManager {
     }
 
     private func cleanupIncludedRoutes(using state: SessionState) -> [String] {
-        let candidates = state.appliedIncludedRoutes ?? configuration.includedRoutes
+        let candidates = state.appliedIncludedRoutes ?? configuredIncludedRoutes()
         return candidates.filter(AppConfig.SplitTunnelConfiguration.isValidCIDR)
     }
 
     private func cleanupResolverDomains(using state: SessionState) -> [String] {
-        let candidates = state.appliedResolverDomains ?? configuration.effectiveResolverDomains
+        let includedRoutes = cleanupIncludedRoutes(using: state)
+        let candidates = state.appliedResolverDomains
+            ?? configuration.effectiveResolverDomains(forIncludedRoutes: includedRoutes)
         return candidates.filter {
             AppConfig.SplitTunnelConfiguration.isValidDomainName($0)
                 && ResolverPaths.isSafeDomainFileName($0)
         }
+    }
+
+    private func configuredIncludedRoutes() -> [String] {
+        configuration.effectiveIncludedRoutes.filter(AppConfig.SplitTunnelConfiguration.isValidCIDR)
+    }
+
+    private func resolvedIncludedRoutes() throws -> [String] {
+        var routes = configuredIncludedRoutes()
+        for host in configuration.includedHostDomains {
+            let addresses = ipv4Resolver(host)
+                .filter(AppConfig.SplitTunnelConfiguration.isValidIPv4Address)
+                .sorted()
+            guard !addresses.isEmpty else {
+                throw RouteManagerError.failedToResolveIncludedHost(host)
+            }
+            routes.append(contentsOf: addresses.map { "\($0)/32" })
+        }
+        return uniquePreservingOrder(routes)
+            .filter(AppConfig.SplitTunnelConfiguration.isValidCIDR)
+    }
+
+    private func uniquePreservingOrder(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for value in values {
+            if seen.insert(value).inserted {
+                result.append(value)
+            }
+        }
+        return result
     }
 
     private func restoreDefaultRouteIfNecessary(using state: SessionState) throws {
@@ -1252,7 +1312,7 @@ struct RouteManager {
                                             preferredRemoteIP: String?,
                                             resolveDNS: Bool) -> Set<String> {
         var addresses = Set<String>()
-        if let preferredRemoteIP, isIPv4Address(preferredRemoteIP) {
+        if let preferredRemoteIP, AppConfig.SplitTunnelConfiguration.isValidIPv4Address(preferredRemoteIP) {
             addresses.insert(preferredRemoteIP)
         }
 
@@ -1277,7 +1337,7 @@ struct RouteManager {
         )
 
         for host in remoteHosts {
-            if isIPv4Address(host) {
+            if AppConfig.SplitTunnelConfiguration.isValidIPv4Address(host) {
                 addresses.insert(host)
                 continue
             }
@@ -1286,37 +1346,48 @@ struct RouteManager {
                 continue
             }
 
-            var hints = addrinfo(
-                ai_flags: AI_ADDRCONFIG,
-                ai_family: AF_INET,
-                ai_socktype: SOCK_DGRAM,
-                ai_protocol: IPPROTO_UDP,
-                ai_addrlen: 0,
-                ai_canonname: nil,
-                ai_addr: nil,
-                ai_next: nil
-            )
-            var resultPointer: UnsafeMutablePointer<addrinfo>?
-            guard getaddrinfo(host, nil, &hints, &resultPointer) == 0,
-                  let firstResult = resultPointer else {
-                continue
-            }
-            defer { freeaddrinfo(firstResult) }
+            addresses.formUnion(ipv4Resolver(host))
+        }
 
-            var cursor: UnsafeMutablePointer<addrinfo>? = firstResult
-            while let current = cursor {
-                if current.pointee.ai_family == AF_INET,
-                   let addr = current.pointee.ai_addr?.withMemoryRebound(to: sockaddr_in.self, capacity: 1, { $0 }) {
-                    var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                    var address = addr.pointee.sin_addr
-                    if inet_ntop(AF_INET, &address, &ipBuffer, socklen_t(INET_ADDRSTRLEN)) != nil {
-                        let length = ipBuffer.firstIndex(of: 0) ?? ipBuffer.endIndex
-                        let bytes = ipBuffer[..<length].map { UInt8(bitPattern: $0) }
-                        addresses.insert(String(decoding: bytes, as: UTF8.self))
-                    }
+        return addresses
+    }
+
+    private static func defaultResolveIPv4Addresses(forHost host: String) -> Set<String> {
+        if AppConfig.SplitTunnelConfiguration.isValidIPv4Address(host) {
+            return [host]
+        }
+
+        var hints = addrinfo(
+            ai_flags: AI_ADDRCONFIG,
+            ai_family: AF_INET,
+            ai_socktype: SOCK_DGRAM,
+            ai_protocol: IPPROTO_UDP,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil
+        )
+        var resultPointer: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &resultPointer) == 0,
+              let firstResult = resultPointer else {
+            return []
+        }
+        defer { freeaddrinfo(firstResult) }
+
+        var addresses = Set<String>()
+        var cursor: UnsafeMutablePointer<addrinfo>? = firstResult
+        while let current = cursor {
+            if current.pointee.ai_family == AF_INET,
+               let addr = current.pointee.ai_addr?.withMemoryRebound(to: sockaddr_in.self, capacity: 1, { $0 }) {
+                var ipBuffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                var address = addr.pointee.sin_addr
+                if inet_ntop(AF_INET, &address, &ipBuffer, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    let length = ipBuffer.firstIndex(of: 0) ?? ipBuffer.endIndex
+                    let bytes = ipBuffer[..<length].map { UInt8(bitPattern: $0) }
+                    addresses.insert(String(decoding: bytes, as: UTF8.self))
                 }
-                cursor = current.pointee.ai_next
             }
+            cursor = current.pointee.ai_next
         }
 
         return addresses
@@ -1324,20 +1395,11 @@ struct RouteManager {
 
     private func normalizeHostRouteDestination(_ destination: String) -> String? {
         if let stripped = destination.split(separator: "/").first,
-           isIPv4Address(String(stripped)) {
+           AppConfig.SplitTunnelConfiguration.isValidIPv4Address(String(stripped)) {
             return String(stripped)
         }
 
-        return isIPv4Address(destination) ? destination : nil
-    }
-
-    private func isIPv4Address(_ value: String) -> Bool {
-        guard !value.isEmpty, value.count <= 15 else {
-            return false
-        }
-
-        var address = in_addr()
-        return value.withCString { inet_pton(AF_INET, $0, &address) } == 1
+        return AppConfig.SplitTunnelConfiguration.isValidIPv4Address(destination) ? destination : nil
     }
 
     private func serviceName(for interfaceName: String) throws -> String? {

@@ -2,7 +2,7 @@
 
 Native macOS client for Case Western Reserve University OpenVPN profiles, built on OpenVPN 3.
 
-- Version: `0.4.3`
+- Version: `0.5.0`
 - Requires: Apple Silicon and macOS 14 or later for prebuilt installs
 - Modes: full tunnel and split tunnel, switchable while connected
 - Scope: no launch daemon and no login item
@@ -92,11 +92,12 @@ The default config is `~/.cwru-ovpn/config.json`. A template lives at [`examples
 | `privacyMode` | `false` by default; when `true`, event logs suppress path and event details |
 | `verbosity` | `silent`, `daily`, or `debug` |
 | `splitTunnel.includedRoutes` | IPv4 CIDRs routed through VPN |
+| `splitTunnel.includedHosts` | IPv4 addresses or hostnames routed through VPN as `/32` host routes |
 | `splitTunnel.resolverDomains` | Domains written to scoped `/etc/resolver` files |
 | `splitTunnel.resolverNameServers` | Fallback scoped DNS servers |
 | `splitTunnel.reachabilityProbeHosts` | Optional health-check hosts; `[]` disables probes |
 
-Reverse DNS zones for included routes are derived automatically.
+Hostnames in `includedHosts` are resolved to IPv4 when split tunnel is applied. These are exact host matches, not wildcard suffix rules. Hostname entries and reverse-DNS zones for all included routes are added to scoped resolver files automatically.
 
 ## Build
 
@@ -134,7 +135,7 @@ brew fetch --build-from-source openssl@3 lz4 fmt
 ./scripts/build-release-binaries.sh
 ```
 
-Release artifacts are Apple Silicon only. The release script writes `dist/cwru-ovpn-macos<major>-arm64`, updates `dist/SHA256SUMS`, and signs binaries when `CWRU_OVPN_CODESIGN_IDENTITY` is set.
+Release artifacts are Apple Silicon only. The release script writes `dist/cwru-ovpn-macos<major>-arm64`, updates `dist/SHA256SUMS`, and signs binaries with the configured Developer ID or an ad-hoc local signature.
 
 On Apple Silicon, `setup.sh` installs a matching verified `dist` binary. If it is missing or wrong-architecture, setup falls back to a local release build.
 

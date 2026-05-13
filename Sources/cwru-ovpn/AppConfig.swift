@@ -61,6 +61,7 @@ enum AppConfigError: LocalizedError {
 struct AppConfig: Codable {
     struct SplitTunnelConfiguration: Codable {
         static let maxIPv4CIDRLength = 18
+        static let maxIPv4AddressLength = 15
         static let maxIPAddressLength = 45
         static let maxDomainNameLength = 253
         static let maxDomainLabelLength = 63
@@ -72,15 +73,18 @@ struct AppConfig: Codable {
         ]
 
         var includedRoutes: [String]
+        var includedHosts: [String]
         var resolverDomains: [String]
         var resolverNameServers: [String]
         var reachabilityProbeHosts: [String]?
 
         init(includedRoutes: [String],
+             includedHosts: [String] = [],
              resolverDomains: [String],
              resolverNameServers: [String],
              reachabilityProbeHosts: [String]?) {
             self.includedRoutes = includedRoutes
+            self.includedHosts = includedHosts
             self.resolverDomains = resolverDomains
             self.resolverNameServers = resolverNameServers
             self.reachabilityProbeHosts = reachabilityProbeHosts
@@ -97,12 +101,45 @@ struct AppConfig: Codable {
             }
         }
 
+        var effectiveIncludedRoutes: [String] {
+            Self.uniquePreservingOrder(includedRoutes + includedHostIPv4Routes)
+        }
+
+        var includedHostDomains: [String] {
+            Self.uniquePreservingOrder(
+                includedHosts.compactMap { host in
+                    let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if Self.isValidIPv4Address(trimmed) {
+                        return nil
+                    }
+                    return Self.isValidDomainName(trimmed) ? trimmed : nil
+                }
+            )
+        }
+
         var effectiveResolverDomains: [String] {
+            effectiveResolverDomains(forIncludedRoutes: effectiveIncludedRoutes)
+        }
+
+        func effectiveResolverDomains(forIncludedRoutes routes: [String]) -> [String] {
+            Self.uniquePreservingOrder(resolverDomains + includedHostDomains + Self.reverseResolverZones(forIncludedRoutes: routes))
+        }
+
+        private var includedHostIPv4Routes: [String] {
+            Self.uniquePreservingOrder(
+                includedHosts.compactMap { host in
+                    let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return Self.isValidIPv4Address(trimmed) ? "\(trimmed)/32" : nil
+                }
+            )
+        }
+
+        private static func uniquePreservingOrder(_ values: [String]) -> [String] {
             var seen = Set<String>()
             var result: [String] = []
-            for domain in resolverDomains + Self.reverseResolverZones(forIncludedRoutes: includedRoutes) {
-                if seen.insert(domain).inserted {
-                    result.append(domain)
+            for value in values {
+                if seen.insert(value).inserted {
+                    result.append(value)
                 }
             }
             return result
@@ -129,6 +166,12 @@ struct AppConfig: Codable {
             for route in includedRoutes {
                 if !Self.isValidCIDR(route) {
                     return "Invalid includedRoute '\(route)'. Expected an IPv4 CIDR block such as '129.22.0.0/16'."
+                }
+            }
+            for host in includedHosts {
+                let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty || (!Self.isValidIPv4Address(trimmed) && !Self.isValidDomainName(trimmed)) {
+                    return "Invalid includedHost '\(host)'. Expected an IPv4 address or hostname such as '129.22.1.10' or 'vpn.case.edu'."
                 }
             }
             for domain in resolverDomains {
@@ -166,6 +209,15 @@ struct AppConfig: Codable {
             return String(parts[0]).withCString { inet_pton(AF_INET, $0, &addr) == 1 }
         }
 
+        static func isValidIPv4Address(_ value: String) -> Bool {
+            guard !value.isEmpty, value.count <= maxIPv4AddressLength else {
+                return false
+            }
+
+            var addr = in_addr()
+            return value.withCString { inet_pton(AF_INET, $0, &addr) == 1 }
+        }
+
         static func isValidDomainName(_ value: String) -> Bool {
             guard !value.isEmpty,
                   value.utf8.count <= maxDomainNameLength,
@@ -201,6 +253,7 @@ struct AppConfig: Codable {
 
         private enum CodingKeys: String, CodingKey {
             case includedRoutes
+            case includedHosts
             case resolverDomains
             case resolverNameServers
             case reachabilityProbeHosts
@@ -209,6 +262,7 @@ struct AppConfig: Codable {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             includedRoutes = try container.decodeIfPresent([String].self, forKey: .includedRoutes) ?? []
+            includedHosts = try container.decodeIfPresent([String].self, forKey: .includedHosts) ?? []
             resolverDomains = try container.decodeIfPresent([String].self, forKey: .resolverDomains) ?? []
             resolverNameServers = try container.decodeIfPresent([String].self, forKey: .resolverNameServers) ?? []
             reachabilityProbeHosts = try container.decodeIfPresent([String].self, forKey: .reachabilityProbeHosts)
@@ -236,6 +290,7 @@ struct AppConfig: Codable {
         privacyMode: false,
         splitTunnel: SplitTunnelConfiguration(
             includedRoutes: [],
+            includedHosts: [],
             resolverDomains: [],
             resolverNameServers: [],
             reachabilityProbeHosts: nil

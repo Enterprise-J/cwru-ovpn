@@ -207,7 +207,7 @@ final class VPNController: NSObject {
             fullTunnelDefaultRoutes: nil,
             fullTunnelDNSServers: nil,
             fullTunnelSearchDomains: nil,
-            appliedIncludedRoutes: configuration.splitTunnel.includedRoutes,
+            appliedIncludedRoutes: configuration.splitTunnel.effectiveIncludedRoutes,
             appliedResolverDomains: configuration.splitTunnel.effectiveResolverDomains,
             routesApplied: false,
             cleanupNeeded: false
@@ -558,7 +558,7 @@ final class VPNController: NSObject {
                 .standardized.path
             if isSafeUserControlledPath(expandedConfigPath),
                let configuration = try? AppConfig.load(explicitConfigPath: expandedConfigPath) {
-                includedRoutes = configuration.splitTunnel.includedRoutes
+                includedRoutes = configuration.splitTunnel.effectiveIncludedRoutes
                 resolverDomains = configuration.splitTunnel.effectiveResolverDomains
             }
         }
@@ -826,7 +826,10 @@ final class VPNController: NSObject {
 
         if tunnelMode == .split {
             do {
-                try routeManager.applySplitTunnel(using: &connectedState)
+                try routeManager.applySplitTunnel(using: &connectedState) { [self] preparedState in
+                    sessionState = preparedState
+                    try saveState()
+                }
             } catch {
                 do {
                     let cleanupHealthy = try routeManager.cleanup(using: connectedState)
@@ -1218,7 +1221,10 @@ final class VPNController: NSObject {
         do {
             switch requestedMode {
             case .split:
-                try routeManager.applySplitTunnel(using: &updatedState)
+                try routeManager.applySplitTunnel(using: &updatedState) { [self] preparedState in
+                    sessionState = preparedState
+                    try saveState()
+                }
             case .full:
                 try routeManager.switchToFullTunnel(using: &updatedState,
                                                     fullTunnelRoutes: updatedState.fullTunnelDefaultRoutes ?? [])
@@ -1229,7 +1235,10 @@ final class VPNController: NSObject {
             rollbackState.lastEvent = "MODE_SWITCH_FAILED"
             rollbackState.lastInfo = "Mode switch to \(requestedMode.modeDescription) failed: \(error.localizedDescription)"
             if previousMode == .split {
-                _ = try? routeManager.applySplitTunnel(using: &rollbackState)
+                _ = try? routeManager.applySplitTunnel(using: &rollbackState) { [self] preparedState in
+                    sessionState = preparedState
+                    try saveState(preservingPendingModeSwitch: false)
+                }
             } else {
                 _ = try? routeManager.switchToFullTunnel(using: &rollbackState,
                                                          fullTunnelRoutes: rollbackState.fullTunnelDefaultRoutes ?? [])
