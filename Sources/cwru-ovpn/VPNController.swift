@@ -682,7 +682,8 @@ final class VPNController: NSObject {
     static func printStatus() {
         let session = SessionState.load()
         let configFilePath = session?.configFilePath
-        let configuredVerbosity = (try? AppConfig.load(explicitConfigPath: configFilePath))?.verbosity ?? .daily
+        let configuration = try? AppConfig.load(explicitConfigPath: configFilePath)
+        let configuredVerbosity = configuration?.verbosity ?? .daily
 
         guard let session else {
             print("Status: Disconnected")
@@ -718,8 +719,33 @@ final class VPNController: NSObject {
         if session.cleanupNeeded {
             print("Cleanup required: yes")
         }
+        printSplitTunnelHealthIfNeeded(for: session, configuration: configuration)
         if configuredVerbosity == .debug {
             print("Event log: \(RuntimePaths.eventLogFile.path)")
+        }
+    }
+
+    static func splitTunnelHealthChecks(for session: SessionState,
+                                        configuration: AppConfig?) -> [SplitTunnelHealthCheck] {
+        guard session.phase == .connected,
+              session.tunnelMode == .split else {
+            return []
+        }
+
+        let manager = RouteManager(configuration: (configuration ?? AppConfig.fallback).splitTunnel)
+        return manager.splitTunnelHealthChecks(using: session)
+    }
+
+    static func printSplitTunnelHealthIfNeeded(for session: SessionState,
+                                               configuration: AppConfig?) {
+        let checks = splitTunnelHealthChecks(for: session, configuration: configuration)
+        guard !checks.isEmpty else {
+            return
+        }
+
+        print("Split health:")
+        for check in checks {
+            print("  \(check.status.rawValue) \(check.name): \(check.detail)")
         }
     }
 

@@ -104,6 +104,7 @@ enum Diagnostics {
             } else if let lastInfo = session.lastInfo, !lastInfo.isEmpty {
                 print("Last info: \(lastInfo)")
             }
+            VPNController.printSplitTunnelHealthIfNeeded(for: session, configuration: config)
         } else {
             print("Session status: Disconnected")
         }

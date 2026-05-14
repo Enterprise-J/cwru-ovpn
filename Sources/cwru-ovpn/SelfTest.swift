@@ -39,6 +39,8 @@ enum SelfTest {
         try testPhysicalDNSCaptureRejectsUnsafeServiceName()
         try testMockedSplitTunnelFlow()
         try testSplitTunnelUsesMacOSHostCacheResolver()
+        try testSplitTunnelRefreshRemovesStaleResolverFiles()
+        try testSplitTunnelHealthCleansManagedStaleResolverFiles()
         try testSplitTunnelCleansDynamicRoutesAfterPartialFailure()
         try testSplitTunnelRejectsLeakyDefaultDNS()
         try testSplitTunnelAllowsSupplementalDefaultSearchDomains()
@@ -955,6 +957,149 @@ enum SelfTest {
                    "Hostname includes should query the macOS host cache resolver.")
         try expect(mockSystem.recordedCommands.contains("/sbin/route -n add -net 172.64.80.1/32 -interface utun7"),
                    "Split tunnel should add routes learned from the macOS host cache resolver.")
+    }
+
+    private static func testSplitTunnelRefreshRemovesStaleResolverFiles() throws {
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-refresh")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            includedHosts: [],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        var session = makeSessionState(
+            pid: 1010,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        session.pushedDNSServers = ["129.22.4.32"]
+        session.appliedIncludedRoutes = ["129.22.0.0/16", "172.64.80.1/32"]
+        session.appliedResolverDomains = [
+            "case.edu",
+            "stale.example",
+            "1.80.64.172.in-addr.arpa"
+        ]
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Automatic",
+                                    tunnelInterfaces: ["utun7"])
+
+        try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+            try FileManager.default.createDirectory(at: resolverDirectory, withIntermediateDirectories: true)
+            try "old\n".write(to: ResolverPaths.fileURL(for: "stale.example"),
+                              atomically: true,
+                              encoding: .utf8)
+            try "old\n".write(to: ResolverPaths.fileURL(for: "1.80.64.172.in-addr.arpa"),
+                              atomically: true,
+                              encoding: .utf8)
+
+            try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                try RouteManager(configuration: configuration).applySplitTunnel(using: &session)
+            }
+
+            try expect(!FileManager.default.fileExists(atPath: ResolverPaths.fileURL(for: "stale.example").path),
+                       "Split refresh should remove resolver files no longer present in the refreshed config.")
+            try expect(!FileManager.default.fileExists(atPath: ResolverPaths.fileURL(for: "1.80.64.172.in-addr.arpa").path),
+                       "Split refresh should remove stale reverse resolver files from old host includes.")
+            try expect(FileManager.default.fileExists(atPath: ResolverPaths.fileURL(for: "case.edu").path),
+                       "Split refresh should keep current scoped resolver files.")
+        }
+
+        try expect(mockSystem.recordedCommands.contains("/sbin/route -n delete -net 172.64.80.1/32"),
+                   "Split refresh should delete old dynamic host routes.")
+        try expect(!mockSystem.recordedCommands.contains("/sbin/route -n add -net 172.64.80.1/32 -interface utun7"),
+                   "Split refresh should not re-add removed host routes.")
+    }
+
+    private static func testSplitTunnelHealthCleansManagedStaleResolverFiles() throws {
+        let resolverDirectory = temporaryDirectory(named: "cwru-ovpn-resolver-health")
+        defer { try? FileManager.default.removeItem(at: resolverDirectory) }
+
+        let configuration = AppConfig.SplitTunnelConfiguration(
+            includedRoutes: ["129.22.0.0/16"],
+            includedHosts: [],
+            resolverDomains: ["case.edu"],
+            resolverNameServers: ["129.22.4.32"],
+            reachabilityProbeHosts: nil
+        )
+
+        var session = makeSessionState(
+            pid: 1011,
+            profilePath: "/tmp/profile.ovpn",
+            configFilePath: "/tmp/config.json",
+            physicalGateway: "192.168.1.1",
+            physicalInterface: "en0",
+            physicalServiceName: "Wi-Fi",
+            originalDNSServers: ["1.1.1.1"],
+            originalSearchDomains: ["home"],
+            originalIPv6Mode: "Automatic",
+            tunName: "utun7",
+            tunnelMode: .split,
+            cleanupNeeded: true
+        )
+        session.pushedDNSServers = ["129.22.4.32"]
+        session.appliedIncludedRoutes = ["129.22.0.0/16"]
+        session.appliedResolverDomains = ["case.edu", "22.129.in-addr.arpa"]
+
+        let mockSystem = MockSystem(serviceName: "Wi-Fi",
+                                    physicalGateway: "192.168.1.1",
+                                    physicalInterface: "en0",
+                                    physicalDNSServers: ["1.1.1.1"],
+                                    physicalSearchDomains: ["home"],
+                                    ipv6Mode: "Off",
+                                    tunnelInterfaces: ["utun7"],
+                                    initialRoutes: [
+                                        MockSystem.RouteRecord(destination: "129.22.0.0/16",
+                                                               gateway: "link#1",
+                                                               interfaceName: "utun7")
+                                    ])
+        let manager = RouteManager(configuration: configuration)
+
+        try withEnvironmentVariable("CWRU_OVPN_RESOLVER_DIR", value: resolverDirectory.path) {
+            try FileManager.default.createDirectory(at: resolverDirectory, withIntermediateDirectories: true)
+            try scopedResolverContents(domain: "case.edu", nameServer: "129.22.4.32")
+                .write(to: ResolverPaths.fileURL(for: "case.edu"),
+                       atomically: true,
+                       encoding: .utf8)
+            try scopedResolverContents(domain: "old.example", nameServer: "129.22.4.32")
+                .write(to: ResolverPaths.fileURL(for: "old.example"),
+                       atomically: true,
+                       encoding: .utf8)
+
+            try Shell.withTestHook({ try mockSystem.handle($0) }) {
+                let checks = manager.splitTunnelHealthChecks(using: session)
+                try expect(checks.contains { $0.name == "resolvers" && $0.status == .fail },
+                           "Split health should flag stale managed resolver files.")
+                try expect(!checks.contains { $0.name == "host-routes" },
+                           "Split health should not warn for CWRU-only host routes.")
+                var cdnSession = session
+                cdnSession.appliedIncludedRoutes = ["129.22.0.0/16", "172.64.80.1/32"]
+                let cdnChecks = manager.splitTunnelHealthChecks(using: cdnSession)
+                try expect(cdnChecks.contains { $0.name == "host-routes" && $0.status == .warn },
+                           "Split health should warn for known shared-CDN /32 host routes.")
+                _ = try manager.monitorAndRepair(using: session)
+            }
+
+            try expect(!FileManager.default.fileExists(atPath: ResolverPaths.fileURL(for: "old.example").path),
+                       "Route monitor should remove stale managed resolver files.")
+        }
     }
 
     private static func testPhysicalDNSCapture() throws {
@@ -2162,6 +2307,10 @@ enum SelfTest {
         if !condition() {
             throw SelfTestError.failed(message)
         }
+    }
+
+    private static func scopedResolverContents(domain: String, nameServer: String) -> String {
+        "nameserver \(nameServer)\ndomain \(domain)\nsearch_order 1\n"
     }
 
     private static func expectRejectsUnexpectedArgument(_ arguments: [String],

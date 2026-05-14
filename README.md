@@ -2,7 +2,7 @@
 
 Native macOS client for Case Western Reserve University OpenVPN profiles, built on OpenVPN 3.
 
-- Version: `0.5.1`
+- Version: `0.5.2`
 - Requires: Apple Silicon and macOS 14 or later for prebuilt installs
 - Modes: full tunnel and split tunnel, switchable while connected
 - Scope: no launch daemon and no login item
@@ -98,6 +98,8 @@ The default config is `~/.cwru-ovpn/config.json`. A template lives at [`examples
 | `splitTunnel.reachabilityProbeHosts` | Optional health-check hosts; `[]` disables probes |
 
 Hostnames in `includedHosts` are resolved to IPv4 when split tunnel is applied. These are exact host matches, not wildcard suffix rules. Hostname entries and reverse-DNS zones for all included routes are added to scoped resolver files automatically.
+
+Browsers with DNS-over-HTTPS may bypass macOS scoped resolvers. Disable browser DoH if split-tunnel DNS behavior matters.
 
 ## Build
 

@@ -48,6 +48,18 @@ private struct ActiveDefaultResolverLeakState {
     }
 }
 
+enum SplitTunnelCheckStatus: String {
+    case pass = "PASS"
+    case warn = "WARN"
+    case fail = "FAIL"
+}
+
+struct SplitTunnelHealthCheck {
+    let status: SplitTunnelCheckStatus
+    let name: String
+    let detail: String
+}
+
 enum RouteManagerError: LocalizedError {
     case couldNotDeterminePhysicalGateway
     case failedToRestoreFullTunnelRoutes
@@ -77,6 +89,23 @@ enum RouteManagerError: LocalizedError {
 struct RouteManager {
     let configuration: AppConfig.SplitTunnelConfiguration
     private let ipv4Resolver: (String) -> Set<String>
+    private static let knownSharedCDNIPv4Routes = [
+        "103.21.244.0/22",
+        "103.22.200.0/22",
+        "103.31.4.0/22",
+        "104.16.0.0/13",
+        "104.24.0.0/14",
+        "108.162.192.0/18",
+        "131.0.72.0/22",
+        "141.101.64.0/18",
+        "162.158.0.0/15",
+        "172.64.0.0/13",
+        "173.245.48.0/20",
+        "188.114.96.0/20",
+        "190.93.240.0/20",
+        "197.234.240.0/22",
+        "198.41.128.0/17",
+    ].compactMap(RouteManager.canonicalIPv4Route)
 
     init(configuration: AppConfig.SplitTunnelConfiguration,
          ipv4Resolver: @escaping (String) -> Set<String> = RouteManager.defaultResolveIPv4Addresses(forHost:)) {
@@ -142,9 +171,12 @@ struct RouteManager {
         let validatedTunnelName = try validatedTunnelInterfaceName(tunnelName)
 
         var mutatedNetwork = false
+        var staleResolverDomainsForCleanup: [String] = []
 
         do {
             let staleIncludedRoutes = cleanupIncludedRoutes(using: state)
+            let staleResolverDomains = cleanupResolverDomains(using: state)
+            staleResolverDomainsForCleanup = staleResolverDomains
             let staticIncludedRoutes = configuredIncludedRoutes()
             state.appliedIncludedRoutes = staticIncludedRoutes
             state.appliedResolverDomains = resolverDomains(forIncludedRoutes: staticIncludedRoutes, using: state)
@@ -162,6 +194,7 @@ struct RouteManager {
             }
 
             try disablePhysicalIPv6IfEnabled(using: state)
+            try removeResolverFiles(for: staleResolverDomains)
             try installResolverFiles(using: state)
             try restoreDNSConfiguration(using: state)
             try flushDNS()
@@ -188,6 +221,7 @@ struct RouteManager {
             if mutatedNetwork {
                 state.routesApplied = false
                 _ = try? cleanup(using: state)
+                _ = try? removeResolverFiles(for: staleResolverDomainsForCleanup)
             }
             throw error
         }
@@ -367,6 +401,8 @@ struct RouteManager {
                     try deleteIPv4NetRoute(route, allowNonZero: true)
                     try addIPv4NetRoute(route, interfaceName: validatedTunnelName, allowNonZero: true)
                 }
+                EventLog.append(note: "Route health check repaired split-tunnel routing drift.",
+                                phase: state.phase)
             } catch {
                 try? installSplitTunnelRouting(using: state,
                                                gateway: gateway,
@@ -412,6 +448,102 @@ struct RouteManager {
         _ = try Shell.run("/usr/bin/killall", arguments: ["-HUP", "mDNSResponder"], allowNonZero: true, requirePrivileges: true)
     }
 
+    func splitTunnelHealthChecks(using state: SessionState) -> [SplitTunnelHealthCheck] {
+        var checks: [SplitTunnelHealthCheck] = []
+        let includedRoutes = cleanupIncludedRoutes(using: state)
+        let resolverDomains = cleanupResolverDomains(using: state)
+
+        if let tunnelName = state.tunName,
+           let validatedTunnelName = try? validatedTunnelInterfaceName(tunnelName),
+           tunnelInterfaceIsPresent(named: validatedTunnelName) {
+            do {
+                let table = try routingTableEntries()
+                let missingRoutes = includedRoutes.filter {
+                    !routeExists($0, on: validatedTunnelName, in: table)
+                }
+                if missingRoutes.isEmpty {
+                    checks.append(SplitTunnelHealthCheck(
+                        status: .pass,
+                        name: "routes",
+                        detail: "\(includedRoutes.count) included route\(includedRoutes.count == 1 ? "" : "s") on \(validatedTunnelName)"
+                    ))
+                } else {
+                    checks.append(SplitTunnelHealthCheck(
+                        status: .fail,
+                        name: "routes",
+                        detail: "missing on \(validatedTunnelName): \(missingRoutes.joined(separator: ", "))"
+                    ))
+                }
+            } catch {
+                checks.append(SplitTunnelHealthCheck(
+                    status: .warn,
+                    name: "routes",
+                    detail: "could not inspect IPv4 routing table: \(error.localizedDescription)"
+                ))
+            }
+        } else {
+            checks.append(SplitTunnelHealthCheck(
+                status: .fail,
+                name: "routes",
+                detail: "tunnel interface is missing"
+            ))
+        }
+
+        let leakState = activeDefaultResolverLeakState(using: state)
+        if leakState.usesVPNNameServers {
+            checks.append(SplitTunnelHealthCheck(
+                status: .fail,
+                name: "dns",
+                detail: "default resolver is using VPN DNS"
+            ))
+        } else if leakState.overlapsVPNSearchDomains {
+            checks.append(SplitTunnelHealthCheck(
+                status: .warn,
+                name: "dns",
+                detail: "default resolver still has VPN search domains"
+            ))
+        } else {
+            checks.append(SplitTunnelHealthCheck(
+                status: .pass,
+                name: "dns",
+                detail: "default resolver is isolated from VPN DNS"
+            ))
+        }
+
+        let missingResolvers = resolverDomains.filter {
+            !FileManager.default.fileExists(atPath: ResolverPaths.fileURL(for: $0).path)
+        }.sorted()
+        let staleResolvers = staleManagedResolverDomains(using: state)
+        if staleResolvers.isEmpty, missingResolvers.isEmpty {
+            checks.append(SplitTunnelHealthCheck(
+                status: .pass,
+                name: "resolvers",
+                detail: "\(resolverDomains.count) scoped resolver file\(resolverDomains.count == 1 ? "" : "s") match current split config"
+            ))
+        } else {
+            var parts: [String] = []
+            if !staleResolvers.isEmpty {
+                parts.append("stale: \(staleResolvers.joined(separator: ", "))")
+            }
+            if !missingResolvers.isEmpty {
+                parts.append("missing: \(missingResolvers.joined(separator: ", "))")
+            }
+            checks.append(SplitTunnelHealthCheck(
+                status: .fail,
+                name: "resolvers",
+                detail: "scoped files \(parts.joined(separator: "; "))"
+            ))
+        }
+
+        checks.append(ipv6HealthCheck(using: state))
+
+        if let hostRouteWarning = hostRouteHealthCheck(using: state) {
+            checks.append(hostRouteWarning)
+        }
+
+        return checks
+    }
+
     private func installResolverFiles(using state: SessionState) throws {
         let nameServers = resolverNameServers(for: state)
         let resolverDomains = cleanupResolverDomains(using: state)
@@ -446,7 +578,11 @@ struct RouteManager {
     }
 
     private func removeResolverFiles(using state: SessionState) throws {
-        for domain in cleanupResolverDomains(using: state) {
+        try removeResolverFiles(for: cleanupResolverDomains(using: state))
+    }
+
+    private func removeResolverFiles(for domains: [String]) throws {
+        for domain in domains {
             _ = try Shell.run("/bin/rm",
                               arguments: ["-f", ResolverPaths.fileURL(for: domain).path],
                               allowNonZero: true,
@@ -487,6 +623,35 @@ struct RouteManager {
     private func resolverDomains(forIncludedRoutes routes: [String], using state: SessionState) -> [String] {
         uniquePreservingOrder(configuration.effectiveResolverDomains(forIncludedRoutes: routes)
             + vpnReverseResolverZones(using: state))
+    }
+
+    private func staleManagedResolverDomains(using state: SessionState) -> [String] {
+        let expectedDomains = Set(cleanupResolverDomains(using: state))
+        let nameServers = resolverNameServers(for: state)
+        guard !nameServers.isEmpty,
+              let files = try? FileManager.default.contentsOfDirectory(at: ResolverPaths.directory,
+                                                                        includingPropertiesForKeys: nil) else {
+            return []
+        }
+
+        return files.compactMap { file -> String? in
+            let domain = file.lastPathComponent
+            guard !expectedDomains.contains(domain),
+                  AppConfig.SplitTunnelConfiguration.isValidDomainName(domain),
+                  ResolverPaths.isSafeDomainFileName(domain),
+                  managedResolverFile(at: file, domain: domain, nameServers: nameServers) else {
+                return nil
+            }
+            return domain
+        }
+        .sorted()
+    }
+
+    private func managedResolverFile(at file: URL, domain: String, nameServers: [String]) -> Bool {
+        guard let contents = try? String(contentsOf: file, encoding: .utf8) else {
+            return false
+        }
+        return contents == resolverContents(for: domain, nameServers: nameServers)
     }
 
     private func vpnReverseResolverZones(using state: SessionState) -> [String] {
@@ -739,10 +904,11 @@ struct RouteManager {
     }
 
     private func validateResolverFiles(using state: SessionState) throws -> Bool {
+        let removedStaleResolvers = try removeStaleManagedResolverFiles(using: state)
         let nameServers = resolverNameServers(for: state)
         let resolverDomains = cleanupResolverDomains(using: state)
         guard !resolverDomains.isEmpty, !nameServers.isEmpty else {
-            return false
+            return removedStaleResolvers
         }
 
         for domain in resolverDomains {
@@ -757,7 +923,19 @@ struct RouteManager {
             }
         }
 
-        return false
+        return removedStaleResolvers
+    }
+
+    private func removeStaleManagedResolverFiles(using state: SessionState) throws -> Bool {
+        let staleDomains = staleManagedResolverDomains(using: state)
+        guard !staleDomains.isEmpty else {
+            return false
+        }
+
+        try removeResolverFiles(for: staleDomains)
+        EventLog.append(note: "Split-tunnel privacy check removed stale scoped resolver files.",
+                        phase: state.phase)
+        return true
     }
 
     private func currentDNSConfiguration(using state: SessionState) throws -> PhysicalDNSConfiguration? {
@@ -840,6 +1018,62 @@ struct RouteManager {
         }
 
         return normalizedIPv6Mode(try ipv6Mode(forServiceNamed: serviceName)) == normalizedIPv6Mode(state.originalIPv6Mode)
+    }
+
+    private func ipv6HealthCheck(using state: SessionState) -> SplitTunnelHealthCheck {
+        guard let serviceName = state.physicalServiceName, !serviceName.isEmpty else {
+            return SplitTunnelHealthCheck(status: .warn,
+                                          name: "ipv6",
+                                          detail: "physical network service is unknown")
+        }
+
+        let originalMode = normalizedIPv6Mode(state.originalIPv6Mode)
+        guard originalMode != nil, originalMode != "off" else {
+            return SplitTunnelHealthCheck(status: .pass,
+                                          name: "ipv6",
+                                          detail: "physical IPv6 was already off or unmanaged")
+        }
+
+        do {
+            let currentMode = normalizedIPv6Mode(try ipv6Mode(forServiceNamed: serviceName,
+                                                              requirePrivileges: false))
+            if currentMode == "off" {
+                return SplitTunnelHealthCheck(status: .pass,
+                                              name: "ipv6",
+                                              detail: "physical IPv6 is off")
+            }
+            return SplitTunnelHealthCheck(status: .fail,
+                                          name: "ipv6",
+                                          detail: "physical IPv6 is \(currentMode ?? "unknown")")
+        } catch {
+            return SplitTunnelHealthCheck(status: .warn,
+                                          name: "ipv6",
+                                          detail: "could not inspect physical IPv6: \(error.localizedDescription)")
+        }
+    }
+
+    private func hostRouteHealthCheck(using state: SessionState) -> SplitTunnelHealthCheck? {
+        let sharedCDNHostRoutes = cleanupIncludedRoutes(using: state)
+            .compactMap { route -> String? in
+                guard let canonical = Self.canonicalIPv4Route(route),
+                      canonical.prefixLength == 32,
+                      Self.knownSharedCDNIPv4Routes.contains(where: {
+                          Self.ipv4Address(canonical.networkAddress, isIn: $0)
+                      }) else {
+                    return nil
+                }
+                return route
+            }
+
+        if !sharedCDNHostRoutes.isEmpty {
+            return SplitTunnelHealthCheck(
+                status: .warn,
+                name: "host-routes",
+                detail: "shared-CDN /32 routes may serve other hostnames: \(sharedCDNHostRoutes.joined(separator: ", "))"
+            )
+        }
+
+        return nil
     }
 
     private func firstNonEmptyList<T>(_ candidates: [T]?...) -> [T] {
@@ -1035,11 +1269,12 @@ struct RouteManager {
         }
     }
 
-    private func ipv6Mode(forServiceNamed serviceName: String) throws -> String? {
+    private func ipv6Mode(forServiceNamed serviceName: String,
+                          requirePrivileges: Bool = true) throws -> String? {
         let output = try Shell.run("/usr/sbin/networksetup",
                                    arguments: ["-getinfo", serviceName],
                                    allowNonZero: true,
-                                   requirePrivileges: true)
+                                   requirePrivileges: requirePrivileges)
 
         for line in output.stdout.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
