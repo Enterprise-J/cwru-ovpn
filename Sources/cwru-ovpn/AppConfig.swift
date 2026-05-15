@@ -287,7 +287,7 @@ struct AppConfig: Codable {
         profilePath: nil,
         tunnelMode: .split,
         preventSleep: true,
-        privacyMode: false,
+        privacyMode: true,
         splitTunnel: SplitTunnelConfiguration(
             includedRoutes: [],
             includedHosts: [],

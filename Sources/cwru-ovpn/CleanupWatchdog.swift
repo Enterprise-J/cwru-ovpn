@@ -32,7 +32,7 @@ enum CleanupWatchdog {
             return
         }
         let cleanupConfig = try? AppConfig.load(explicitConfigPath: session.configFilePath)
-        EventLog.configure(privacyMode: cleanupConfig?.privacyMode ?? false)
+        EventLog.configure(privacyMode: cleanupConfig?.privacyMode ?? true)
 
         guard session.pid == parentPID,
               parentStartTime == nil || session.processStartTime == parentStartTime else {

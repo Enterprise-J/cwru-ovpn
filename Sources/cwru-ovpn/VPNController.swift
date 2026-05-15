@@ -542,6 +542,28 @@ final class VPNController: NSObject {
             )
         }
 
+        try validateIPAddresses(session.originalDNSServers, label: "original DNS servers")
+        try validateIPAddresses(session.pushedDNSServers, label: "pushed DNS servers")
+        try validateIPAddresses(session.fullTunnelDNSServers, label: "full-tunnel DNS servers")
+        try validateSearchDomains(session.originalSearchDomains, label: "original search domains")
+        try validateSearchDomains(session.pushedSearchDomains, label: "pushed search domains")
+        try validateSearchDomains(session.fullTunnelSearchDomains, label: "full-tunnel search domains")
+
+        if let originalIPv6Mode = session.originalIPv6Mode,
+           !originalIPv6Mode.isEmpty,
+           !isSafeIPv6Mode(originalIPv6Mode) {
+            throw VPNControllerError.unsafeSessionState(
+                "Refusing cleanup due to an invalid IPv6 mode in session state."
+            )
+        }
+
+        if let fullTunnelDefaultRoutes = session.fullTunnelDefaultRoutes,
+           !fullTunnelDefaultRoutes.allSatisfy(isSafeManagedIPv4Route) {
+            throw VPNControllerError.unsafeSessionState(
+                "Refusing cleanup due to invalid full-tunnel routes in session state."
+            )
+        }
+
         if let appliedIncludedRoutes = session.appliedIncludedRoutes,
            !appliedIncludedRoutes.allSatisfy(AppConfig.SplitTunnelConfiguration.isValidCIDR) {
             throw VPNControllerError.unsafeSessionState(
@@ -613,6 +635,48 @@ final class VPNController: NSObject {
 
         return value.withCString { pointer in
             inet_pton(AF_INET, pointer, &ipv4) == 1 || inet_pton(AF_INET6, pointer, &ipv6) == 1
+        }
+    }
+
+    private static func validateIPAddresses(_ values: [String]?, label: String) throws {
+        guard let values,
+              !values.allSatisfy(isSafeIPAddress) else {
+            return
+        }
+        throw VPNControllerError.unsafeSessionState(
+            "Refusing cleanup due to invalid \(label) in session state."
+        )
+    }
+
+    private static func validateSearchDomains(_ values: [String]?, label: String) throws {
+        guard let values,
+              !values.allSatisfy(AppConfig.SplitTunnelConfiguration.isValidDomainName) else {
+            return
+        }
+        throw VPNControllerError.unsafeSessionState(
+            "Refusing cleanup due to invalid \(label) in session state."
+        )
+    }
+
+    private static func isSafeIPv6Mode(_ value: String) -> Bool {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "", "automatic", "off", "link-local only", "link local only", "linklocal":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isSafeManagedIPv4Route(_ route: ManagedIPv4Route) -> Bool {
+        guard AppConfig.SplitTunnelConfiguration.isValidCIDR(route.destination) else {
+            return false
+        }
+
+        switch route.nextHopKind {
+        case .gateway:
+            return isSafeIPAddress(route.nextHopValue)
+        case .interface:
+            return isSafeInterfaceName(route.nextHopValue)
         }
     }
 

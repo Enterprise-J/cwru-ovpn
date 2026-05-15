@@ -18,6 +18,7 @@ enum SelfTest {
     static func run() throws {
         try testReachabilityProbeConfig()
         try testPreventSleepConfig()
+        try testPrivacyModeConfig()
         try testLegacyConfigKeys()
         try testLenientSplitTunnelDecoding()
         try testIncludedHostsConfig()
@@ -28,6 +29,7 @@ enum SelfTest {
         try testCLIAdvancedOptions()
         try testGeneratedSudoers()
         try testPrivacyModeEventLog()
+        try testEventLogRejectsHardlink()
         try testRecoveryState()
         try testStatusIndicators()
         try testRouteCanonicalization()
@@ -153,6 +155,41 @@ enum SelfTest {
         let disabledConfig = try JSONDecoder().decode(AppConfig.self, from: disabledData)
         try expect(!disabledConfig.preventSleep,
                    "preventSleep false should allow system sleep.")
+    }
+
+    private static func testPrivacyModeConfig() throws {
+        let defaultedData = Data(
+            """
+            {
+              "splitTunnel": {
+                "includedRoutes": [],
+                "resolverDomains": [],
+                "resolverNameServers": []
+              }
+            }
+            """.utf8
+        )
+
+        let defaultedConfig = try JSONDecoder().decode(AppConfig.self, from: defaultedData)
+        try expect(defaultedConfig.privacyMode,
+                   "privacyMode should default to true when omitted from config.")
+
+        let disabledData = Data(
+            """
+            {
+              "privacyMode": false,
+              "splitTunnel": {
+                "includedRoutes": [],
+                "resolverDomains": [],
+                "resolverNameServers": []
+              }
+            }
+            """.utf8
+        )
+
+        let disabledConfig = try JSONDecoder().decode(AppConfig.self, from: disabledData)
+        try expect(!disabledConfig.privacyMode,
+                   "privacyMode should honor explicit false.")
     }
 
     private static func testLegacyConfigKeys() throws {
@@ -460,7 +497,7 @@ enum SelfTest {
     private static func testPrivacyModeEventLog() throws {
         let homeStateDirectory = temporaryDirectory(named: "cwru-ovpn-private-log-state")
         defer {
-            EventLog.configure(privacyMode: false)
+            EventLog.configure(privacyMode: true)
             try? FileManager.default.removeItem(at: homeStateDirectory)
         }
 
@@ -484,6 +521,33 @@ enum SelfTest {
                        "Privacy-mode event logs should suppress raw event info.")
             try expect(!logText.contains("10.8.0.2"),
                        "Privacy-mode event logs should suppress note details.")
+        }
+    }
+
+    private static func testEventLogRejectsHardlink() throws {
+        let homeStateDirectory = temporaryDirectory(named: "cwru-ovpn-hardlink-log-state")
+        defer { try? FileManager.default.removeItem(at: homeStateDirectory) }
+
+        try withEnvironmentVariable("CWRU_OVPN_HOME_STATE_DIR", value: homeStateDirectory.path) {
+            try RuntimePaths.ensureStateDirectory()
+            let target = RuntimePaths.stateDirectory.appendingPathComponent("linked-events-target")
+            try "existing\n".write(to: target, atomically: true, encoding: .utf8)
+            try? FileManager.default.removeItem(at: RuntimePaths.eventLogFile)
+
+            guard link(target.path, RuntimePaths.eventLogFile.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+
+            do {
+                let handle = try EventLog.openEventLogForAppendForSelfTest()
+                try? handle.close()
+                throw SelfTestError.failed("Event log open should reject hardlinked files.")
+            } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(EMLINK) {
+            }
+
+            let targetText = try String(contentsOf: target, encoding: .utf8)
+            try expect(targetText == "existing\n",
+                       "Rejected hardlinked event logs should not be modified.")
         }
     }
 
@@ -617,6 +681,15 @@ enum SelfTest {
             ("network service", { $0.physicalServiceName = String(repeating: "W", count: 129) }),
             ("server IP", { $0.serverIP = String(repeating: "1", count: AppConfig.SplitTunnelConfiguration.maxIPAddressLength + 1) }),
             ("gateway", { $0.physicalGateway = String(repeating: "1", count: AppConfig.SplitTunnelConfiguration.maxIPAddressLength + 1) }),
+            ("original DNS server", { $0.originalDNSServers = ["1.1.1.1\nnameserver 8.8.8.8"] }),
+            ("pushed DNS server", { $0.pushedDNSServers = ["bad dns"] }),
+            ("full-tunnel DNS server", { $0.fullTunnelDNSServers = ["999.999.999.999"] }),
+            ("original search domain", { $0.originalSearchDomains = ["bad domain"] }),
+            ("pushed search domain", { $0.pushedSearchDomains = ["bad/domain"] }),
+            ("full-tunnel search domain", { $0.fullTunnelSearchDomains = [".case.edu"] }),
+            ("IPv6 mode", { $0.originalIPv6Mode = "Automatic\n-setv6off" }),
+            ("full-tunnel route", { $0.fullTunnelDefaultRoutes = [ManagedIPv4Route(destination: "bad route", nextHopKind: .gateway, nextHopValue: "1.1.1.1")] }),
+            ("full-tunnel route next hop", { $0.fullTunnelDefaultRoutes = [ManagedIPv4Route(destination: "0.0.0.0/1", nextHopKind: .interface, nextHopValue: "-utun7")] }),
             ("included route", { $0.appliedIncludedRoutes = [String(repeating: "1", count: AppConfig.SplitTunnelConfiguration.maxIPv4CIDRLength + 1)] }),
             ("resolver domain", { $0.appliedResolverDomains = [tooLongDomain] }),
             ("profile path", { $0.profilePath = "/" + String(repeating: "a", count: 1024) }),

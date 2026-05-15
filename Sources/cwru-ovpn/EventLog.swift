@@ -109,7 +109,7 @@ private struct EventLogNoteRecord: Encodable {
 
 enum EventLog {
     private static let privacyLock = NSLock()
-    nonisolated(unsafe) private static var privacyMode = false
+    nonisolated(unsafe) private static var privacyMode = true
 
     static func configure(privacyMode enabled: Bool) {
         privacyLock.lock()
@@ -183,6 +183,12 @@ enum EventLog {
         }
     }
 
+#if CWRU_OVPN_INCLUDE_SELF_TEST
+    static func openEventLogForAppendForSelfTest() throws -> FileHandle {
+        try openEventLogForAppend()
+    }
+#endif
+
     private static func openEventLogForAppend() throws -> FileHandle {
         let path = RuntimePaths.eventLogFile.path
         let fd = open(path,
@@ -206,6 +212,13 @@ enum EventLog {
             throw NSError(domain: NSPOSIXErrorDomain,
                           code: Int(EFTYPE),
                           userInfo: [NSLocalizedDescriptionKey: "Refusing to append to a non-regular event log file."])
+        }
+
+        guard fileInfo.st_nlink == 1 else {
+            close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain,
+                          code: Int(EMLINK),
+                          userInfo: [NSLocalizedDescriptionKey: "Refusing to append to a hardlinked event log file."])
         }
 
         guard fchmod(fd, mode_t(S_IRUSR | S_IWUSR)) == 0 else {

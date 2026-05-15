@@ -2,7 +2,7 @@
 
 Native macOS client for Case Western Reserve University OpenVPN profiles, built on OpenVPN 3.
 
-- Version: `0.5.2`
+- Version: `0.5.3`
 - Requires: Apple Silicon and macOS 14 or later for prebuilt installs
 - Modes: full tunnel and split tunnel, switchable while connected
 - Scope: no launch daemon and no login item
@@ -56,7 +56,7 @@ For foreground debug:
 sudo /Library/PrivilegedHelperTools/cwru-ovpn/cwru-ovpn connect --config ~/.cwru-ovpn/config.json --verbosity debug --foreground
 ```
 
-`events.ndjson` may include connection metadata. Treat it as sensitive.
+By default, `events.ndjson` suppresses paths and free-form VPN details. If you set `"privacyMode": false`, treat the log as sensitive.
 
 ## Commands
 
@@ -89,13 +89,13 @@ The default config is `~/.cwru-ovpn/config.json`. A template lives at [`examples
 | `profilePath` | `.ovpn` profile path |
 | `tunnelMode` | `split` or `full` |
 | `preventSleep` | `true` by default |
-| `privacyMode` | `false` by default; when `true`, event logs suppress path and event details |
+| `privacyMode` | `true` by default; when `true`, event logs suppress path and event details |
 | `verbosity` | `silent`, `daily`, or `debug` |
 | `splitTunnel.includedRoutes` | IPv4 CIDRs routed through VPN |
 | `splitTunnel.includedHosts` | IPv4 addresses or hostnames routed through VPN as `/32` host routes |
 | `splitTunnel.resolverDomains` | Domains written to scoped `/etc/resolver` files |
 | `splitTunnel.resolverNameServers` | Fallback scoped DNS servers |
-| `splitTunnel.reachabilityProbeHosts` | Optional health-check hosts; `[]` disables probes |
+| `splitTunnel.reachabilityProbeHosts` | Health-check hosts; omitted uses built-in public probes, `[]` disables probes |
 
 Hostnames in `includedHosts` are resolved to IPv4 when split tunnel is applied. These are exact host matches, not wildcard suffix rules. Hostname entries and reverse-DNS zones for all included routes are added to scoped resolver files automatically.
 

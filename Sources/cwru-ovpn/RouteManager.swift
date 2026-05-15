@@ -89,6 +89,9 @@ enum RouteManagerError: LocalizedError {
 struct RouteManager {
     let configuration: AppConfig.SplitTunnelConfiguration
     private let ipv4Resolver: (String) -> Set<String>
+    private static let rootUserID = uid_t(0)
+    private static let wheelGroupID = gid_t(0)
+    private static let resolverFileMode = mode_t(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
     private static let knownSharedCDNIPv4Routes = [
         "103.21.244.0/22",
         "103.22.200.0/22",
@@ -557,14 +560,14 @@ struct RouteManager {
             let resolverFile = ResolverPaths.fileURL(for: domain)
             let content = resolverContents(for: domain, nameServers: nameServers)
             if getuid() == 0 {
-                try content.write(to: resolverFile, atomically: true, encoding: .utf8)
+                try installRootOwnedResolverFile(content: content, at: resolverFile)
             } else {
                 _ = try Shell.run("/usr/bin/tee",
                                   arguments: [resolverFile.path],
                                   input: Data(content.utf8),
                                   requirePrivileges: true)
+                try hardenResolverFile(at: resolverFile)
             }
-            try hardenResolverFile(at: resolverFile)
         }
     }
 
@@ -575,6 +578,112 @@ struct RouteManager {
         _ = try Shell.run("/bin/chmod",
                           arguments: ["0644", resolverFile.path],
                           requirePrivileges: true)
+    }
+
+    private func installRootOwnedResolverFile(content: String, at resolverFile: URL) throws {
+        let directory = resolverFile.deletingLastPathComponent()
+        let tempURL = directory
+            .appendingPathComponent(".\(resolverFile.lastPathComponent).\(UUID().uuidString).tmp")
+        var tempFD: Int32 = -1
+        var renamed = false
+
+        defer {
+            if tempFD >= 0 {
+                close(tempFD)
+            }
+            if !renamed {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+        }
+
+        tempFD = open(tempURL.path,
+                      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                      Self.resolverFileMode)
+        guard tempFD >= 0 else {
+            throw resolverFileFailure("Failed to create temporary resolver file \(tempURL.path)", errno)
+        }
+
+        guard fchown(tempFD, Self.rootUserID, Self.wheelGroupID) == 0 else {
+            throw resolverFileFailure("Failed to set owner on \(tempURL.path)", errno)
+        }
+        guard fchmod(tempFD, Self.resolverFileMode) == 0 else {
+            throw resolverFileFailure("Failed to set mode on \(tempURL.path)", errno)
+        }
+
+        try writeAll(Data(content.utf8), to: tempFD, path: tempURL.path)
+        guard fsync(tempFD) == 0 else {
+            throw resolverFileFailure("Failed to sync resolver file \(tempURL.path)", errno)
+        }
+        try assertRootOwnedResolverFile(fileDescriptor: tempFD, path: tempURL.path)
+
+        guard close(tempFD) == 0 else {
+            let closeError = errno
+            tempFD = -1
+            throw resolverFileFailure("Failed to close resolver file \(tempURL.path)", closeError)
+        }
+        tempFD = -1
+
+        guard rename(tempURL.path, resolverFile.path) == 0 else {
+            throw resolverFileFailure("Failed to replace resolver file \(resolverFile.path)", errno)
+        }
+        renamed = true
+
+        try assertRootOwnedResolverFile(path: resolverFile.path)
+    }
+
+    private func writeAll(_ data: Data, to fileDescriptor: Int32, path: String) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                return
+            }
+            var totalWritten = 0
+            while totalWritten < rawBuffer.count {
+                let bytesWritten = write(fileDescriptor,
+                                         baseAddress.advanced(by: totalWritten),
+                                         rawBuffer.count - totalWritten)
+                if bytesWritten < 0 {
+                    if errno == EINTR {
+                        continue
+                    }
+                    throw resolverFileFailure("Failed to write resolver file \(path)", errno)
+                }
+                guard bytesWritten > 0 else {
+                    throw resolverFileFailure("Failed to write resolver file \(path)", EIO)
+                }
+                totalWritten += bytesWritten
+            }
+        }
+    }
+
+    private func assertRootOwnedResolverFile(path: String) throws {
+        let fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else {
+            throw resolverFileFailure("Failed to open resolver file \(path)", errno)
+        }
+        defer { close(fd) }
+        try assertRootOwnedResolverFile(fileDescriptor: fd, path: path)
+    }
+
+    private func assertRootOwnedResolverFile(fileDescriptor: Int32, path: String) throws {
+        var fileInfo = stat()
+        guard fstat(fileDescriptor, &fileInfo) == 0 else {
+            throw resolverFileFailure("Failed to inspect resolver file \(path)", errno)
+        }
+        guard (fileInfo.st_mode & S_IFMT) == S_IFREG,
+              fileInfo.st_uid == Self.rootUserID,
+              fileInfo.st_gid == Self.wheelGroupID,
+              fileInfo.st_nlink == 1,
+              mode_t(fileInfo.st_mode & 0o777) == Self.resolverFileMode else {
+            throw NSError(domain: NSPOSIXErrorDomain,
+                          code: Int(EFTYPE),
+                          userInfo: [NSLocalizedDescriptionKey: "Refusing to trust resolver file \(path)."])
+        }
+    }
+
+    private func resolverFileFailure(_ context: String, _ error: Int32) -> NSError {
+        NSError(domain: NSPOSIXErrorDomain,
+                code: Int(error),
+                userInfo: [NSLocalizedDescriptionKey: "\(context): \(String(cString: strerror(error)))"])
     }
 
     private func removeResolverFiles(using state: SessionState) throws {
