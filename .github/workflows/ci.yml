@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-tests:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            deployment_target: "15.0"
+            developer_dir: /Applications/Xcode_26.3.app/Contents/Developer
+          - runner: macos-26
+            deployment_target: "26.0"
+            developer_dir: /Applications/Xcode.app/Contents/Developer
+    env:
+      CWRU_OVPN_MACOS_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+      DEVELOPER_DIR: ${{ matrix.developer_dir }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install build dependencies
+        run: brew install openssl@4 lz4 fmt
+
+      - name: Checkout pinned OpenVPN dependencies
+        run: |
+          git clone --filter=blob:none https://github.com/OpenVPN/openvpn3.git ../openvpn3
+          git -C ../openvpn3 checkout 7f572f4fe647a36f5a1094cbeb261a5bcdae5047
+          git -C ../openvpn3 apply "$GITHUB_WORKSPACE/scripts/patches/openvpn3-cwru-policy.patch"
+          git clone --filter=blob:none https://github.com/chriskohlhoff/asio.git ../asio
+          git -C ../asio checkout 8806a6803cde7054c3049d3666d3ec36786568c5
+
+      - name: Validate scripts
+        run: |
+          bash -n scripts/test.sh scripts/build-release-binaries.sh scripts/build-third-party-libs.sh scripts/setup.sh
+          zsh -n scripts/cwru-ovpn.zsh
+
+      - name: Build and test
+        run: ./scripts/test.sh
+
+      - name: Check whitespace
+        run: git diff --check

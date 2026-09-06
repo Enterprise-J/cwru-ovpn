@@ -1,0 +1,77 @@
+diff --git a/openvpn/client/cliopt.hpp b/openvpn/client/cliopt.hpp
+index 3cca5e4b8..53b3da3c8 100644
+--- a/openvpn/client/cliopt.hpp
++++ b/openvpn/client/cliopt.hpp
+@@ -466,5 +466,5 @@ class ClientOptions : public RC<thread_unsafe_refcount>
+                 {
+                     tunconf->tun_persist.reset(new TunMac::TunPersist(true, TunWrapObjRetain::NO_RETAIN, nullptr));
+-#ifndef OPENVPN_COMMAND_AGENT
++#if !defined(OPENVPN_COMMAND_AGENT) && !defined(CWRU_OVPN_DISABLE_REMOTE_BYPASS)
+                     /* remote_list is required by remote_bypass to work */
+                     tunconf->tun_prop.remote_bypass = true;
+diff --git a/openvpn/tun/mac/client/tunsetup.hpp b/openvpn/tun/mac/client/tunsetup.hpp
+index dfe34d6e6..3addee788 100644
+--- a/openvpn/tun/mac/client/tunsetup.hpp
++++ b/openvpn/tun/mac/client/tunsetup.hpp
+@@ -14,5 +14,7 @@
+ #ifndef OPENVPN_TUN_MAC_CLIENT_TUNSETUP_H
+ #define OPENVPN_TUN_MAC_CLIENT_TUNSETUP_H
+-
++
++#define CWRU_OVPN_NATIVE_DNS_DISABLED 1
++
+ #include <string>
+ #include <sstream>
+@@ -31,7 +33,4 @@
+ #include <openvpn/tun/mac/utun.hpp>
+ #include <openvpn/tun/mac/gw.hpp>
+-#include <openvpn/tun/mac/macdns_watchdog.hpp>
+-#include <openvpn/tun/proxy.hpp>
+-#include <openvpn/tun/mac/macproxy.hpp>
+ #include <openvpn/tun/builder/rgwflags.hpp>
+ #include <openvpn/tun/builder/setup.hpp>
+@@ -481,22 +480,6 @@ class Setup : public TunBuilderSetup::Base
+         // Interface down
+         destroy.add(iface_down);
+-
++
+-        // configure DNS
+-        {
+-            MacDNS::Config::Ptr dns(new MacDNS::Config(pull));
+-            MacDNSWatchdog::add_actions(dns,
+-                                        MacDNSWatchdog::FLUSH_RECONFIG
+-#ifdef ENABLE_DNS_WATCHDOG
+-                                            | MacDNSWatchdog::SYNCHRONOUS
+-                                            | MacDNSWatchdog::ENABLE_WATCHDOG
+-#endif
+-                                        ,
+-                                        create,
+-                                        destroy);
+-        }
+-
+-        if (pull.proxy_auto_config_url.defined())
+-            ProxySettings::add_actions<MacProxySettings>(pull, create, destroy);
+     }
+-
++
+     ActionList::Ptr remove_cmds;
+diff --git a/openvpn/tun/mac/utun.hpp b/openvpn/tun/mac/utun.hpp
+index adfd46b25..de7aa62e7 100644
+--- a/openvpn/tun/mac/utun.hpp
++++ b/openvpn/tun/mac/utun.hpp
+@@ -72,7 +72,13 @@ inline int utun_open(std::string &name, const int unit)
+     // If the connect is successful, a utunX device will be created, where X
+     // is our unit number - 1.
+     if (connect(fd(), (struct sockaddr *)&sc, sizeof(sc)) == -1)
+-        return -1;
+-
++    {
++        const int err = errno;
++        if (err == EBUSY)
++            return -1;
++
++        throw utun_error("connect(utun" + to_string(unit) + "): " + std::string(strerror(err)));
++    }
++
+     // Get iface name of newly created utun dev.
+     char utunname[20];
