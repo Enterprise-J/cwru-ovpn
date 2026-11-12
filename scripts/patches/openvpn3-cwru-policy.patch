@@ -1,0 +1,271 @@
+diff --git a/openvpn/client/cliconnect.hpp b/openvpn/client/cliconnect.hpp
+index bae8b9bb..997ad279 100644
+--- a/openvpn/client/cliconnect.hpp
++++ b/openvpn/client/cliconnect.hpp
+@@ -39,6 +39,7 @@
+ #ifndef OPENVPN_CLIENT_CLICONNECT_H
+ #define OPENVPN_CLIENT_CLICONNECT_H
+
++#include <atomic>
+ #include <memory>
+ #include <utility>
+ #include <chrono>
+@@ -61,7 +62,7 @@ namespace openvpn {
+ class ClientConnect : ClientProto::NotifyCallback,
+                       RemoteList::BulkResolve::NotifyCallback,
+                       ClientLifeCycle::NotifyCallback,
+-                      public RC<thread_unsafe_refcount>
++                      public RC<thread_safe_refcount>
+ {
+   public:
+     using Ptr = RCPtr<ClientConnect>;
+@@ -719,7 +720,7 @@ class ClientConnect : ClientProto::NotifyCallback,
+     }
+
+     unsigned int generation;
+-    bool halt;
++    std::atomic<bool> halt;
+     bool paused;
+     bool client_finalized;
+     bool dont_restart_;
+diff --git a/openvpn/client/cliopt.hpp b/openvpn/client/cliopt.hpp
+index 044e7c2d..5d3223b8 100644
+--- a/openvpn/client/cliopt.hpp
++++ b/openvpn/client/cliopt.hpp
+@@ -472,7 +472,7 @@ class ClientOptions : public RC<thread_unsafe_refcount>
+                 if (config.clientconf.tunPersist)
+                 {
+                     tunconf->tun_persist.reset(new TunMac::TunPersist(true, TunWrapObjRetain::NO_RETAIN, nullptr));
+-#ifndef OPENVPN_COMMAND_AGENT
++#if !defined(OPENVPN_COMMAND_AGENT) && !defined(CWRU_OVPN_DISABLE_REMOTE_BYPASS)
+                     /* remote_list is required by remote_bypass to work */
+                     tunconf->tun_prop.remote_bypass = true;
+                     tunconf->tun_prop.remote_list = remote_list;
+diff --git a/openvpn/tun/mac/client/tuncli.hpp b/openvpn/tun/mac/client/tuncli.hpp
+index 4fd509f3..4b791af5 100644
+--- a/openvpn/tun/mac/client/tuncli.hpp
++++ b/openvpn/tun/mac/client/tuncli.hpp
+@@ -21,6 +21,7 @@
+ #include <openvpn/common/to_string.hpp>
+ #include <openvpn/asio/scoped_asio_stream.hpp>
+ #include <openvpn/common/cleanup.hpp>
++#include <openvpn/common/scoped_fd.hpp>
+ #include <openvpn/tun/client/tunbase.hpp>
+ #include <openvpn/tun/client/tunprop.hpp>
+ #include <openvpn/tun/persist/tunpersist.hpp>
+@@ -209,26 +210,29 @@ class Client : public TunClient
+                     tsconf.layer = config->tun_prop.layer;
+
+                     // open/config tun
+-                    int fd = -1;
+-                    {
+-                        std::ostringstream os;
+-                        auto os_print = Cleanup([&os]()
+-                                                { OPENVPN_LOG_STRING(os.str()); });
+-                        fd = tun_setup->establish(*po, &tsconf, config->stop, os);
+-                    }
++                    std::ostringstream os;
++                    auto os_print = Cleanup([&os]()
++                                            { OPENVPN_LOG_STRING(os.str()); });
++                    ScopedFD fd;
++                    ScopedTUNStream ts;
++                    auto rollback = Cleanup([&]()
++                                            { tun_setup->destroy(os); });
++                    fd.reset(tun_setup->establish(*po, &tsconf, config->stop, os));
+
+                     // create ASIO wrapper for tun fd
+-                    TUNStream *ts = new TUNStream(io_context, fd);
++                    ts.reset(new TUNStream(io_context, fd()));
++                    fd.release();
+
+                     // persist tun settings state
+                     state->iface_name = tsconf.iface_name;
+                     state->tun_prefix = tsconf.tun_prefix;
+-                    if (tun_persist->persist_tun_state(ts, state))
++                    if (tun_persist->persist_tun_state(ts.release(), state))
+                         OPENVPN_LOG("TunPersist: saving tun context:\n"
+                                     << tun_persist->options());
+
+                     // enable tun_setup destructor
+                     tun_persist->add_destructor(tun_setup);
++                    rollback.dismiss();
+                 }
+
+                 // configure tun interface packet forwarding
+diff --git a/openvpn/tun/mac/client/tunsetup.hpp b/openvpn/tun/mac/client/tunsetup.hpp
+index dfe34d6e..5c24213b 100644
+--- a/openvpn/tun/mac/client/tunsetup.hpp
++++ b/openvpn/tun/mac/client/tunsetup.hpp
+@@ -14,14 +14,18 @@
+ #ifndef OPENVPN_TUN_MAC_CLIENT_TUNSETUP_H
+ #define OPENVPN_TUN_MAC_CLIENT_TUNSETUP_H
+
++#define CWRU_OVPN_NATIVE_DNS_DISABLED 1
++
+ #include <string>
+ #include <sstream>
+ #include <ostream>
++#include <utility>
+
+ #include <openvpn/common/exception.hpp>
+ #include <openvpn/common/rc.hpp>
+ #include <openvpn/common/size.hpp>
+ #include <openvpn/common/arraysize.hpp>
++#include <openvpn/common/cleanup.hpp>
+ #include <openvpn/common/action.hpp>
+ #include <openvpn/common/process.hpp>
+ #include <openvpn/common/jsonlib.hpp>
+@@ -30,9 +34,6 @@
+ #include <openvpn/tun/mac/tunutil.hpp>
+ #include <openvpn/tun/mac/utun.hpp>
+ #include <openvpn/tun/mac/gw.hpp>
+-#include <openvpn/tun/mac/macdns_watchdog.hpp>
+-#include <openvpn/tun/proxy.hpp>
+-#include <openvpn/tun/mac/macproxy.hpp>
+ #include <openvpn/tun/builder/rgwflags.hpp>
+ #include <openvpn/tun/builder/setup.hpp>
+
+@@ -132,6 +133,10 @@ class Setup : public TunBuilderSetup::Base
+             throw ErrorCode(Error::TUN_IFACE_CREATE, true, e.what());
+         }
+
++        ScopedFD tun_fd(fd);
++        auto rollback = Cleanup([&]()
++                                { destroy(os); });
++
+         // create ActionLists for setting up and removing adapter properties
+         ActionList::Ptr add_cmds(new ActionList());
+         remove_cmds.reset(new ActionList());
+@@ -150,16 +155,14 @@ class Setup : public TunBuilderSetup::Base
+         remove_cmds->enable_destroy(true);
+
+         os << "open " << conf->iface_name << " SUCCEEDED\n";
+-        return fd;
++        rollback.dismiss();
++        return tun_fd.release();
+     }
+
+     void destroy(std::ostream &os) override // defined by DestructorBase
+     {
+-        if (remove_cmds)
+-        {
+-            remove_cmds->destroy(os);
+-            remove_cmds.reset();
+-        }
++        if (auto actions = std::move(remove_cmds))
++            actions->destroy(os);
+     }
+
+     virtual ~Setup()
+@@ -481,22 +484,6 @@ class Setup : public TunBuilderSetup::Base
+         // Interface down
+         destroy.add(iface_down);
+
+-        // configure DNS
+-        {
+-            MacDNS::Config::Ptr dns(new MacDNS::Config(pull));
+-            MacDNSWatchdog::add_actions(dns,
+-                                        MacDNSWatchdog::FLUSH_RECONFIG
+-#ifdef ENABLE_DNS_WATCHDOG
+-                                            | MacDNSWatchdog::SYNCHRONOUS
+-                                            | MacDNSWatchdog::ENABLE_WATCHDOG
+-#endif
+-                                        ,
+-                                        create,
+-                                        destroy);
+-        }
+-
+-        if (pull.proxy_auto_config_url.defined())
+-            ProxySettings::add_actions<MacProxySettings>(pull, create, destroy);
+     }
+
+     ActionList::Ptr remove_cmds;
+diff --git a/openvpn/tun/mac/utun.hpp b/openvpn/tun/mac/utun.hpp
+index adfd46b2..c1c2d259 100644
+--- a/openvpn/tun/mac/utun.hpp
++++ b/openvpn/tun/mac/utun.hpp
+@@ -37,6 +37,7 @@
+ #include <openvpn/common/exception.hpp>
+ #include <openvpn/common/to_string.hpp>
+ #include <openvpn/common/scoped_fd.hpp>
++#include <openvpn/common/sockopt.hpp>
+
+ namespace openvpn::TunMac::UTun {
+ OPENVPN_EXCEPTION(utun_error);
+@@ -59,6 +60,8 @@ inline int utun_open(std::string &name, const int unit)
+     if (!fd.defined())
+         throw utun_error("socket(SYSPROTO_CONTROL)");
+
++    SockOpt::set_cloexec(fd());
++
+     if (ioctl(fd(), CTLIOCGINFO, &ctlInfo) == -1)
+         throw utun_error("ioctl(CTLIOCGINFO)");
+
+@@ -72,7 +75,13 @@ inline int utun_open(std::string &name, const int unit)
+     // If the connect is successful, a utunX device will be created, where X
+     // is our unit number - 1.
+     if (connect(fd(), (struct sockaddr *)&sc, sizeof(sc)) == -1)
+-        return -1;
++    {
++        const int err = errno;
++        if (err == EBUSY)
++            return -1;
++
++        throw utun_error("connect(utun" + to_string(unit) + "): " + std::string(strerror(err)));
++    }
+
+     // Get iface name of newly created utun dev.
+     char utunname[20];
+diff --git a/openvpn/addr/addrpair.hpp b/openvpn/addr/addrpair.hpp
+index ca74eb48..c1842b76 100644
+--- a/openvpn/addr/addrpair.hpp
++++ b/openvpn/addr/addrpair.hpp
+@@ -12,7 +12,10 @@
+ #ifndef OPENVPN_ADDR_ADDRPAIR_H
+ #define OPENVPN_ADDR_ADDRPAIR_H
+ 
++#include <charconv>
+ #include <sstream>
++#include <string_view>
++#include <system_error>
+ 
+ #include <openvpn/common/exception.hpp>
+ #include <openvpn/common/number.hpp>
+@@ -171,6 +174,28 @@ struct AddrMaskPair
+         OPENVPN_THROW(addr_pair_mask_parse_error, "AddrMaskPair parse error '" << title << "': " << s << " : " << e.what());
+     }
+ 
++    /**
++     * @brief Parses an %IP prefix length from a string view.
++     * @param s String view containing the prefix length to parse.
++     * @return Parsed prefix length as an unsigned integer.
++     * @throws number_parse_exception If parsing fails, overflows, or exceeds @c Addr::V6_SIZE.
++     */
++    static unsigned int parse_prefix_len_throw(std::string_view s)
++    {
++        unsigned int val = 0;
++        const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), val);
++
++        // ec catches overflow (result_out_of_range) and invalid format (invalid_argument);
++        // ptr check ensures complete string consumption. The widest-address bound keeps the
++        // parse away from the overflow that defeats netmask_from_prefix_len's own range guard,
++        // which still applies the per-version bound.
++        if (ec != std::errc{} || ptr != s.data() + s.size() || val > Addr::V6_SIZE)
++        {
++            throw number_parse_exception("prefix length");
++        }
++        return val;
++    }
++
+     static AddrMaskPair from_string_impl(const StringPair &pair, const char *title = nullptr)
+     {
+         AddrMaskPair ret;
+@@ -181,7 +206,7 @@ struct AddrMaskPair
+             {
+                 if (is_number(pair[1].c_str()))
+                     ret.netmask = Addr::netmask_from_prefix_len(ret.addr.version(),
+-                                                                parse_number_throw<unsigned int>(pair[1], "prefix length"));
++                                                                parse_prefix_len_throw(pair[1]));
+                 else
+                     ret.netmask = Addr::from_string(pair[1]);
+                 ret.netmask.prefix_len(); // verify that netmask is ok

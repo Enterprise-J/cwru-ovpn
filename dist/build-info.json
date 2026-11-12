@@ -1,0 +1,16 @@
+{
+  "appVersion": "1.0.0",
+  "gitCommit": "2c09a3b5433a02751b5368b8726b1543a66518d4",
+  "gitDirty": true,
+  "hostArch": "arm64",
+  "macosSDKVersion": "27.2",
+  "swiftVersion": "Apple Swift version 6.4.2 (swiftlang-6.4.2.1.9 clang-2100.4.1.1)",
+  "openvpn3Commit": "7f572f4fe647a36f5a1094cbeb261a5bcdae5047",
+  "openvpn3Patch": { "file": "openvpn3-cwru-policy.patch", "sha256": "bc5bfffdb11d12ce21cdc6d47a35b04f8b132071d74bde5baee07e8d364e0820" },
+  "asioCommit": "8806a6803cde7054c3049d3666d3ec36786568c5",
+  "artifacts": [
+    { "file": "cwru-ovpn-macos15-arm64.app.tar.gz", "deploymentTarget": "15.0", "sha256": "7d88d42254adf7fea91587ede02a35751e9aabd81f653d2e4c0efb68f6f1e000", "teamIdentifier": "not set", "thirdPartyPrefixSha256": "a760949bf75c8cd95bd1963c0eaac45bdf284ac04e998b76987b6badd9a393ce", "thirdPartyBuildMetadataSha256": "a32f2775465f8275efd48f02e0d4ed288affe8a47167003d0b0ae9c3280ef209" },
+    { "file": "cwru-ovpn-macos26-arm64.app.tar.gz", "deploymentTarget": "26.0", "sha256": "00077eeadca0dfafbdeb86d17a9b1e9ebd730dd8151dad8a6a2902d9e3035741", "teamIdentifier": "not set", "thirdPartyPrefixSha256": "e8d8c2918670ef986b7a3d50624d5240a40210de2e1260e63c4dcb988989d4e4", "thirdPartyBuildMetadataSha256": "036a5090449255dcd5ba5bbe58a83a743f4134bb33acd7623f792f7da714273d" },
+    { "file": "cwru-ovpn-macos27-arm64.app.tar.gz", "deploymentTarget": "27.0", "sha256": "8ac8f70905c6295203550a6d0a8d55b9117e636e1c1781d36f5f4b8235b70aab", "teamIdentifier": "not set", "thirdPartyPrefixSha256": "9ab727ac5ee9bc22c01e270d9f18f2d6ffb9129ddf7bf5859f53e5b748797737", "thirdPartyBuildMetadataSha256": "6d5e27d104175ded82b7b0b15b3c92d63297135c0e9e257ee964f526567ea371" }
+  ]
+}
