@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-tests:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            deployment_target: "15.0"
+            developer_dir: /Applications/Xcode_26.3.app/Contents/Developer
+          - runner: macos-26
+            deployment_target: "26.0"
+            developer_dir: /Applications/Xcode.app/Contents/Developer
+          - runner: xcode-27
+            deployment_target: "27.0"
+            developer_dir: /Applications/Xcode.app/Contents/Developer
+    env:
+      CWRU_OVPN_MACOS_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+      DEVELOPER_DIR: ${{ matrix.developer_dir }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Check CMake
+        run: cmake --version
+
+      - name: Checkout pinned OpenVPN dependencies
+        run: |
+          source scripts/dependency-pins.env
+          git clone --filter=blob:none https://github.com/OpenVPN/openvpn3.git ../openvpn3
+          git -C ../openvpn3 checkout "$OPENVPN3_PINNED_COMMIT"
+          git -C ../openvpn3 apply "$GITHUB_WORKSPACE/scripts/patches/openvpn3-cwru-policy.patch"
+          git clone --filter=blob:none https://github.com/chriskohlhoff/asio.git ../asio
+          git -C ../asio checkout "$ASIO_PINNED_COMMIT"
+
+      - name: Validate scripts
+        run: |
+          for script in scripts/*.sh scripts/dependency-pins.env; do
+            bash -n "$script"
+          done
+          zsh -n scripts/cwru-ovpn.zsh
+
+      - name: Build and test
+        run: ./scripts/test.sh
+
+      - name: Verify reproducible static application archives
+        run: |
+          target="${CWRU_OVPN_MACOS_DEPLOYMENT_TARGET%%.*}"
+          archive=".build/local-artifacts/cwru-ovpn-macos${target}-arm64-ad-hoc.app.tar.gz"
+          ./scripts/build-release-binaries.sh "$target"
+          shasum -a 256 "$archive" .build/local-artifacts/build-info.json > "$RUNNER_TEMP/first-build.sha256"
+          ./scripts/build-release-binaries.sh "$target"
+          shasum -a 256 -c "$RUNNER_TEMP/first-build.sha256"
+
+      - name: Check whitespace
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD -- . ':(exclude)scripts/patches'
